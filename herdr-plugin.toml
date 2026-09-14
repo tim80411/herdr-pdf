@@ -1,0 +1,56 @@
+# herdr-plugin.toml — manifest for the herdr PDF Viewer plugin.
+#
+# Renders a PDF page as pixels and paints it into a herdr split pane via
+# herdr's socket API — pane.graphics.stream carrying PNG frames by default,
+# falling back to pane.graphics.set (base64 PNG, 512 KiB cap) only if the
+# stream can't be opened or fails mid-session (KGP/Kitty-graphics-capable
+# terminal required on the herdr client side either way). PNG rather than
+# raw RGBA because herdr never decodes it and never compresses anything
+# itself, so a ~3.7 MB RGBA frame would reach the terminal as ~4.9 MB of
+# base64 escape text per keypress against ~0.44 MB for the same page as
+# PNG; see README for the full path and the HERDR_PDF_TRANSPORT override.
+# j/k (and arrows) page through the document.
+#
+# id charset is validated by herdr's normalize_identifier(): ASCII
+# alphanumeric plus `:` `.` `_` `-`, <=120 chars (manifest.rs). "pdf" is
+# valid. Action ids additionally forbid `.` (normalize_local_identifier),
+# so the single action id below ("open") avoids dots too.
+
+id = "pdf"
+name = "PDF Viewer"
+version = "0.2.0"
+description = "View PDF files as rendered pages in a herdr split pane."
+min_herdr_version = "0.9.0"
+platforms = ["macos", "linux"]
+
+# Compiles the Go sources into bin/herdr-pdf. Idempotent (a plain `go
+# build` overwrite); runs once at link/install time and again on update.
+[[build]]
+command = ["./build.sh"]
+
+# The viewer pane itself. Opened on demand by the "open" action (or
+# directly via `herdr plugin pane open --plugin pdf --entrypoint view`),
+# never automatically — there is no [[events]] hook.
+[[panes]]
+id = "view"
+title = "PDF Viewer"
+placement = "split"
+command = ["./bin/herdr-pdf", "view"]
+
+# Entry point for both link-click handling and manual invocation
+# (`herdr plugin action invoke pdf.open -- /path/to/file.pdf`).
+[[actions]]
+id = "open"
+title = "Open PDF"
+description = "Open a PDF file in a new split pane."
+command = ["./bin/herdr-pdf", "open"]
+
+# Ctrl+click (or OSC 8 file:// activation) on a path ending in .pdf routes
+# here instead of trying to open a browser. Rust regex, TOML-escaped: `\\.`
+# matches a literal dot, `(?i)` makes the whole match case-insensitive so
+# `.PDF` also hits. Matches both bare paths and file:// URLs.
+[[link_handlers]]
+id = "pdf"
+title = "Open PDF"
+pattern = "(?i)^(file://)?.*\\.pdf$"
+action = "open"

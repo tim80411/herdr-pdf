@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+*.log
+
+# Go rewrite build/runtime artifacts
+bin/
+wazero-cache/
+
+
+# spike build artifacts
+spike/go-stream/spike
