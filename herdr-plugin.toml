@@ -18,7 +18,7 @@
 
 id = "pdf"
 name = "PDF Viewer"
-version = "0.2.0"
+version = "0.3.0"
 description = "View PDF files as rendered pages in a herdr split pane."
 min_herdr_version = "0.9.0"
 platforms = ["macos", "linux"]
@@ -44,6 +44,10 @@ command = ["./bin/herdr-pdf", "view"]
 id = "open"
 title = "Open PDF"
 description = "Open a PDF file in a new split pane."
+# With nothing to resolve (a keybinding pressed with no selection) the same
+# pane opens in browser mode on the focused pane's directory instead of
+# failing; a genuine error — a non-PDF, a remote file:// host, a missing
+# file — still reports itself.
 command = ["./bin/herdr-pdf", "open"]
 
 # Ctrl+click (or OSC 8 file:// activation) on a path ending in .pdf routes

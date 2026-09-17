@@ -16,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/tim80411/herdr-pdf/internal/browser"
 	"github.com/tim80411/herdr-pdf/internal/herdr"
 	"github.com/tim80411/herdr-pdf/internal/render"
 	"github.com/tim80411/herdr-pdf/internal/ui"
@@ -88,7 +89,10 @@ func ParseTransport(v string) Transport {
 // Options configures a Viewer. Fields are set from environment variables by
 // cmd/herdr-pdf, keeping this package testable without a real herdr pane.
 type Options struct {
-	PDFPath   string // PDFVIEW_FILE, or argv[1]
+	PDFPath string // PDFVIEW_FILE, or argv[1]
+	// StartDir is PDFVIEW_DIR: where browser mode opens when no file was
+	// named. Empty means this process's working directory.
+	StartDir  string
 	PaneID    string // HERDR_PANE_ID
 	LogPath   string
 	Transport Transport // HERDR_PDF_TRANSPORT
@@ -128,6 +132,30 @@ type Viewer struct {
 	term     ui.Screen
 	stream   frameSink
 	logf     *os.File
+
+	// browser is non-nil while the pane is listing files. Browsing and
+	// reading are two modes of one pane, sharing this terminal, this key
+	// loop and this process — choosing a file does not open a second pane.
+	browser *browser.Model
+
+	// rendererOnce guards pdfium/wazero start-up, which browser mode kicks
+	// off in the background so the cold compile overlaps with the user
+	// choosing a file instead of landing entirely after Enter.
+	rendererOnce sync.Once
+	rendererErr  error
+
+	// graphicsReady marks the transport as resolved and the stream as
+	// opened; browser mode never needs either.
+	graphicsReady bool
+
+	// helping is reading mode's "?" overlay. The page image is handed back
+	// while it is up, since herdr composites graphics above text.
+	helping bool
+
+	// docGen counts documents opened in this process. It tags every png
+	// cache key, so an encode belonging to the file just closed can neither
+	// be served for the new one nor be stored over it by a late prefetch.
+	docGen uint64
 
 	// layerID is resolved at startup (TransportDirect forces "primary").
 	layerID   string
@@ -206,9 +234,13 @@ type encodedPage struct {
 	preview render.Encoded
 }
 
-// pngKey identifies an encoded frame by page and pixel size, so a resize
-// cannot serve a stale encode at the old dimensions.
-type pngKey struct{ page, w, h int }
+// pngKey identifies an encoded frame by document, page and pixel size: a
+// resize must not serve a stale encode at the old dimensions, and switching
+// files must not serve the previous document's pages.
+type pngKey struct {
+	doc        uint64
+	page, w, h int
+}
 
 // pngCacheCap matches the renderer's own cache: the current page plus both
 // neighbours, with room for one stale size left over from a resize.
@@ -341,30 +373,31 @@ func (v *Viewer) Run() (err error) {
 		}
 	}()
 
-	if v.opts.PDFPath == "" {
-		return v.usageScreen("沒有指定 PDF 檔案 (PDFVIEW_FILE is empty)")
+	// A pane opened without a file browses for one instead of complaining:
+	// that is what the "open" action does when nothing named a path, which
+	// is the common case for a keybinding press.
+	browsing := v.opts.PDFPath == ""
+	if !browsing {
+		if fi, statErr := os.Stat(v.opts.PDFPath); statErr != nil || fi.IsDir() {
+			return v.usageScreen(fmt.Sprintf("找不到檔案: %s", v.opts.PDFPath))
+		}
+		// Graphics are a reading-mode concern, so a missing pane id only
+		// stops the half that needs one.
+		if v.opts.PaneID == "" {
+			return v.usageScreen("缺少 HERDR_PANE_ID，無法呼叫 pane.graphics API")
+		}
+		// pdfium init happens before raw mode, so a slow cold wazero compile
+		// shows as a plain blocking start rather than a raw-mode screen with a hidden cursor.
+		if rerr := v.ensureRenderer(); rerr != nil {
+			return v.usageScreen("無法啟動 PDF 引擎（詳見 viewer.log）")
+		}
+		if oerr := v.renderer.Open(v.opts.PDFPath); oerr != nil {
+			v.log("open %s failed: %v", v.opts.PDFPath, oerr)
+			return v.usageScreen(openFailureMessage(oerr, v.opts.PDFPath))
+		}
+		v.docGen++
 	}
-	if fi, statErr := os.Stat(v.opts.PDFPath); statErr != nil || fi.IsDir() {
-		return v.usageScreen(fmt.Sprintf("找不到檔案: %s", v.opts.PDFPath))
-	}
-	if v.opts.PaneID == "" {
-		return v.usageScreen("缺少 HERDR_PANE_ID，無法呼叫 pane.graphics API")
-	}
-
-	// pdfium init happens before raw mode, so a slow cold wazero compile
-	// shows as a plain blocking start rather than a raw-mode screen with a hidden cursor.
-	r, rerr := render.NewRenderer(render.WazeroCacheDir())
-	if rerr != nil {
-		v.log("pdfium init failed: %v", rerr)
-		return v.usageScreen("無法啟動 PDF 引擎（詳見 viewer.log）")
-	}
-	v.renderer = r
-	defer r.Close()
-
-	if oerr := r.Open(v.opts.PDFPath); oerr != nil {
-		v.log("open %s failed: %v", v.opts.PDFPath, oerr)
-		return v.usageScreen(openFailureMessage(oerr, v.opts.PDFPath))
-	}
+	defer v.closeRenderer()
 
 	v.term = ui.New()
 	if terr := v.term.Enter(); terr != nil {
@@ -372,17 +405,11 @@ func (v *Viewer) Run() (err error) {
 	}
 	defer v.shutdown()
 
-	v.resolveTransport()
-	if v.transport != TransportSet {
-		if s, serr := herdr.OpenStream(v.opts.PaneID, v.layerID, 0); serr != nil {
-			v.log("stream open failed, starting in graphics.set mode: %v", serr)
-			v.transport = TransportSet
-		} else {
-			v.stream = s
-		}
+	if browsing {
+		v.enterBrowsing(v.startDir(), "")
+	} else if gerr := v.startGraphics(); gerr != nil {
+		return gerr
 	}
-	v.log("transport=%s layer=%s remote=%v progressive=%v max_frame_kb=%d frame_dir=%q trace=%v",
-		v.transport, v.layerID, v.remote, v.progressive, v.maxFrameBytes>>10, v.frameDir, v.opts.Trace)
 
 	v.fullRedraw()
 
@@ -455,6 +482,221 @@ func (v *Viewer) Run() (err error) {
 	}
 }
 
+// startDir is where browsing begins: PDFVIEW_DIR if it was set, else this
+// process's own working directory.
+func (v *Viewer) startDir() string {
+	if v.opts.StartDir != "" {
+		return v.opts.StartDir
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		return "."
+	}
+	return cwd
+}
+
+// ensureRenderer starts pdfium once, whoever asks first. Browser mode calls
+// it from a background goroutine to warm the wazero compile; the main loop
+// calls it again before using v.renderer and blocks on that warm-up rather
+// than racing it.
+func (v *Viewer) ensureRenderer() error {
+	v.rendererOnce.Do(func() {
+		r, err := render.NewRenderer(render.WazeroCacheDir())
+		if err != nil {
+			v.log("pdfium init failed: %v", err)
+			v.rendererErr = err
+			return
+		}
+		v.renderer = r
+	})
+	return v.rendererErr
+}
+
+// closeRenderer releases pdfium. Deferred before shutdown so it runs after
+// it, i.e. after every background render has been waited for.
+func (v *Viewer) closeRenderer() {
+	if v.renderer != nil {
+		v.renderer.Close()
+		v.renderer = nil
+	}
+}
+
+// startGraphics resolves the transport and opens the frame stream. It runs
+// on the way into reading mode rather than at start-up, because browsing
+// never sends a frame.
+func (v *Viewer) startGraphics() error {
+	if v.graphicsReady {
+		return nil
+	}
+	if v.opts.PaneID == "" {
+		return fmt.Errorf("缺少 HERDR_PANE_ID，無法呼叫 pane.graphics API")
+	}
+	v.resolveTransport()
+	if v.transport != TransportSet {
+		if s, serr := herdr.OpenStream(v.opts.PaneID, v.layerID, 0); serr != nil {
+			v.log("stream open failed, starting in graphics.set mode: %v", serr)
+			v.transport = TransportSet
+		} else {
+			v.stream = s
+		}
+	}
+	v.graphicsReady = true
+	v.log("transport=%s layer=%s remote=%v progressive=%v max_frame_kb=%d frame_dir=%q trace=%v",
+		v.transport, v.layerID, v.remote, v.progressive, v.maxFrameBytes>>10, v.frameDir, v.opts.Trace)
+	return nil
+}
+
+// releaseGraphics hands the pane's graphics layer back before text is drawn
+// over it: a queued refine is dropped, the stream closed (herdr refuses
+// graphics.clear while one is open) and the layer cleared. startGraphics
+// reopens the stream on the way back. An empty layerID means graphics were
+// never started, so there is nothing to clear and herdr would reject the
+// call.
+func (v *Viewer) releaseGraphics(why string) {
+	v.cancelRefine()
+	if v.stream != nil {
+		v.stream.Close()
+		v.stream = nil
+	}
+	v.graphicsReady = false
+	if v.opts.PaneID != "" && v.layerID != "" {
+		if cerr := herdr.GraphicsClear(v.opts.PaneID, v.layerID); cerr != nil {
+			v.log("graphics.clear %s: %v", why, cerr)
+		}
+	}
+}
+
+// openHelp puts reading mode's key table over the page. The page image goes
+// first: herdr composites the graphics layer above the text, so an overlay
+// drawn under it would be invisible.
+func (v *Viewer) openHelp() {
+	v.releaseGraphics("showing help")
+	v.helping = true
+	v.term.ClearScreen()
+}
+
+// dismissHelp closes the overlay and puts the page back, reopening the
+// stream and re-sending the current frame — cheap, because the encode for
+// this page and size is still in the png cache.
+func (v *Viewer) dismissHelp(ev ui.KeyEvent) bool {
+	if ev.Key == ui.KeyEOF {
+		return true
+	}
+	v.helping = false
+	if gerr := v.startGraphics(); gerr != nil {
+		v.log("reopening graphics after help: %v", gerr)
+	}
+	v.term.ClearScreen()
+	v.needRedraw = true
+	return false
+}
+
+// drawHelp paints reading mode's key table. No graphics call is involved.
+func (v *Viewer) drawHelp() {
+	cols, rows, err := ui.Size()
+	if err != nil {
+		v.log("winsize failed: %v", err)
+		cols, rows = 80, 24
+	}
+	v.term.WriteString(readingHelp.RenderHelp(cols, rows))
+}
+
+// enterBrowsing switches the pane to the file listing. Any page already on
+// screen is cleared first: herdr composites the graphics layer above the
+// text, so a leftover image would sit on top of the listing.
+func (v *Viewer) enterBrowsing(dir, focus string) {
+	v.releaseGraphics("entering browser")
+	v.browser = browser.New(dir)
+	if focus != "" {
+		v.browser.Focus(focus)
+	}
+	v.log("browser mode at %s", v.browser.Dir())
+	// Warm pdfium while the user reads the listing, so opening a file is not
+	// the first thing to pay for the cold compile.
+	v.startWork(func() { _ = v.ensureRenderer() })
+	v.term.ClearScreen()
+}
+
+// enterReading loads path and leaves browsing mode. A failure keeps the
+// listing up with the reason on its status line, since the alternative is a
+// pane that has lost both the document and the way back.
+func (v *Viewer) enterReading(path string) {
+	if rerr := v.ensureRenderer(); rerr != nil {
+		v.browser.SetMessage("無法啟動 PDF 引擎（詳見 viewer.log）")
+		return
+	}
+	if oerr := v.renderer.Open(path); oerr != nil {
+		v.log("open %s failed: %v", path, oerr)
+		v.browser.SetMessage(openFailureMessage(oerr, path))
+		return
+	}
+	if gerr := v.startGraphics(); gerr != nil {
+		v.browser.SetMessage(gerr.Error())
+		return
+	}
+
+	v.opts.PDFPath = path
+	v.docGen++
+	v.page = 0
+	v.numBuf = ""
+	v.lastDelta = 0
+	v.browser = nil
+	v.term.ClearScreen()
+	v.log("reading %s (doc gen %d)", path, v.docGen)
+}
+
+// toBrowser returns from reading to the listing, parked on the file just
+// read so the way back is one keypress.
+func (v *Viewer) toBrowser() {
+	v.enterBrowsing(filepath.Dir(v.opts.PDFPath), filepath.Base(v.opts.PDFPath))
+}
+
+// handleBrowserKey applies one key to the listing, returning true to quit.
+func (v *Viewer) handleBrowserKey(ev ui.KeyEvent) bool {
+	switch v.browser.HandleKey(ev) {
+	case browser.ActionQuit:
+		return true
+	case browser.ActionRedraw:
+		v.needRedraw = true
+	case browser.ActionOpen:
+		v.enterReading(v.browser.Chosen())
+		v.needRedraw = true
+	}
+	return false
+}
+
+// drawBrowser paints the listing. No graphics call is involved: browsing is
+// plain text on the pane's own terminal.
+func (v *Viewer) drawBrowser() {
+	cols, rows, err := ui.Size()
+	if err != nil {
+		v.log("winsize failed: %v", err)
+		cols, rows = 80, 24
+	}
+	v.term.WriteString(v.browser.Render(cols, rows))
+}
+
+// readingHelp is the single source of truth for reading mode's keys: the
+// status line's hints and the "?" overlay are both generated from it, so a
+// binding cannot be advertised in one place and forgotten in the other.
+// Only three bindings carry a Hint: the status row shares its width with
+// the filename and the render diagnostics, and hinting everything left the
+// filename as a single ellipsis. The overlay is where the rest belongs.
+var readingHelp = ui.HelpTable{
+	Title: "閱讀模式鍵位",
+	Bindings: []ui.Binding{
+		{Keys: "j  ↓  Space  n  PgDn", What: "下一頁", Hint: "j/k 翻頁"},
+		{Keys: "k  ↑  p  PgUp", What: "上一頁"},
+		{Keys: "g", What: "第一頁"},
+		{Keys: "G", What: "跳到已輸入的頁碼，沒輸入就跳到最後一頁"},
+		{Keys: "0-9 然後 G 或 Enter", What: "跳到第 N 頁（超出範圍夾到頭尾）"},
+		{Keys: "r", What: "強制重繪（畫面有殘影時用）"},
+		{Keys: "o", What: "回到瀏覽模式（目錄為本檔所在目錄）"},
+		{Keys: "?", What: "顯示這張表", Hint: "? 說明"},
+		{Keys: "q  Ctrl-c", What: "離開", Hint: "q 離開"},
+	},
+}
+
 // quitSignals end the session through the same teardown as the q key.
 var quitSignals = []os.Signal{syscall.SIGTERM, syscall.SIGHUP, syscall.SIGINT}
 
@@ -499,7 +741,10 @@ func (v *Viewer) shutdown() {
 		v.stream.Close()
 		v.stream = nil
 	}
-	if v.opts.PaneID != "" {
+	// An empty layerID means graphics were never started — a pane that only
+	// ever browsed. There is nothing on the layer to clear, and herdr
+	// rejects the call outright (invalid_layer_id).
+	if v.opts.PaneID != "" && v.layerID != "" {
 		if cerr := herdr.GraphicsClear(v.opts.PaneID, v.layerID); cerr != nil {
 			v.log("final graphics.clear: %v", cerr)
 		}
@@ -507,6 +752,19 @@ func (v *Viewer) shutdown() {
 	if v.term != nil {
 		v.term.Restore()
 	}
+}
+
+// cancelRefine drops any queued full-resolution follow-up frame. Bumping
+// redrawGen is what makes an already-running sendRefine bail out, so the
+// frame cannot land on a stream that is about to close.
+func (v *Viewer) cancelRefine() {
+	v.workMu.Lock()
+	v.redrawGen.Add(1)
+	if v.refineTimer != nil {
+		v.refineTimer.Stop()
+	}
+	v.pendingRefine = nil
+	v.workMu.Unlock()
 }
 
 // startWork runs fn on a goroutine the shutdown path waits for, and declines
@@ -541,6 +799,14 @@ func openFailureMessage(err error, path string) string {
 // handleKey applies one key event to viewer state, returning true if the
 // viewer should quit.
 func (v *Viewer) handleKey(ev ui.KeyEvent) bool {
+	if v.browser != nil {
+		return v.handleBrowserKey(ev)
+	}
+	if v.helping {
+		// Any key returns to the page, q and Escape included: the key is
+		// aimed at the overlay, not at the session.
+		return v.dismissHelp(ev)
+	}
 	if ev.Key == ui.KeyEOF {
 		return true
 	}
@@ -561,6 +827,15 @@ func (v *Viewer) handleKey(ev ui.KeyEvent) bool {
 			v.jumpOrLast()
 		case 'r':
 			v.numBuf = ""
+			v.needRedraw = true
+		case 'o':
+			// Back to the listing, on this file's own directory.
+			v.numBuf = ""
+			v.toBrowser()
+			v.needRedraw = true
+		case '?':
+			v.numBuf = ""
+			v.openHelp()
 			v.needRedraw = true
 		case '\r', '\n':
 			v.confirmJump()
@@ -805,6 +1080,14 @@ func (v *Viewer) showStatus(cols, rows int, right string) {
 // repaints the status line. Every failure path still shows a status message
 // instead of leaving the pane blank.
 func (v *Viewer) fullRedraw() {
+	if v.browser != nil {
+		v.drawBrowser()
+		return
+	}
+	if v.helping {
+		v.drawHelp()
+		return
+	}
 	v.redrawGen.Add(1)
 	tr := v.beginTrace()
 
@@ -899,6 +1182,9 @@ func (v *Viewer) prefetchNeighbours(rasterW, rasterH int) {
 		return
 	}
 	r := v.renderer
+	// Captured, not read inside the goroutine: by the time it stores, the
+	// pane may have moved on to another document.
+	doc := v.docGen
 	encodeToo := v.transport == TransportStreamPNG
 	v.startWork(func() {
 		for _, p := range want {
@@ -912,15 +1198,15 @@ func (v *Viewer) prefetchNeighbours(rasterW, rasterH int) {
 			// Claim the slot before the encode, not after: claiming after
 			// means two prefetchers can both spend the encode and only then
 			// discover one of them was redundant.
-			if !v.reservePNG(p, frame.Width, frame.Height) {
+			if !v.reservePNG(doc, p, frame.Width, frame.Height) {
 				continue
 			}
 			enc, eerr := v.encodePage(frame)
 			if eerr != nil {
-				v.releasePNG(p, frame.Width, frame.Height)
+				v.releasePNG(doc, p, frame.Width, frame.Height)
 				continue
 			}
-			v.storePNGAt(p, frame, enc)
+			v.storePNGAt(doc, p, frame, enc)
 		}
 	})
 }
@@ -935,7 +1221,7 @@ func (v *Viewer) writeStatus(cols, rows int, right string) {
 	if v.renderer != nil {
 		total = strconv.Itoa(v.renderer.PageCount())
 	}
-	mid := fmt.Sprintf("頁 %d/%s  [j/k 翻頁 g/G 首尾 q 離開]", v.page+1, total)
+	mid := fmt.Sprintf("頁 %d/%s  %s", v.page+1, total, readingHelp.StatusHints())
 	line := ui.StatusLine(name, mid, right, cols)
 	v.term.WriteString(ui.RenderStatusLine(rows, line))
 }
@@ -1045,7 +1331,7 @@ func (v *Viewer) sendStreamPNG(frame *render.Frame, placement herdr.Placement, t
 			tr.mark("png_encode")
 			return "stream-png", 0, eerr
 		}
-		v.storePNGAt(v.page, frame, page)
+		v.storePNGAt(v.docGen, v.page, frame, page)
 	}
 	if hit {
 		tr.mark("png_cached")
@@ -1145,16 +1431,16 @@ func (v *Viewer) sendRefine() {
 func (v *Viewer) lookupPNG(frame *render.Frame) (encodedPage, bool) {
 	v.pngMu.Lock()
 	defer v.pngMu.Unlock()
-	e, ok := v.pngCache[pngKey{v.page, frame.Width, frame.Height}]
+	e, ok := v.pngCache[pngKey{v.docGen, v.page, frame.Width, frame.Height}]
 	return e, ok
 }
 
 // reservePNG claims a cache slot before the encode starts, so a second
 // prefetch for the same frame skips the work rather than duplicating it.
-func (v *Viewer) reservePNG(page, w, h int) bool {
+func (v *Viewer) reservePNG(doc uint64, page, w, h int) bool {
 	v.pngMu.Lock()
 	defer v.pngMu.Unlock()
-	k := pngKey{page, w, h}
+	k := pngKey{doc, page, w, h}
 	if _, done := v.pngCache[k]; done {
 		return false
 	}
@@ -1169,19 +1455,19 @@ func (v *Viewer) reservePNG(page, w, h int) bool {
 }
 
 // releasePNG drops a claim whose encode did not produce anything.
-func (v *Viewer) releasePNG(page, w, h int) {
+func (v *Viewer) releasePNG(doc uint64, page, w, h int) {
 	v.pngMu.Lock()
-	delete(v.pngPending, pngKey{page, w, h})
+	delete(v.pngPending, pngKey{doc, page, w, h})
 	v.pngMu.Unlock()
 }
 
-func (v *Viewer) storePNGAt(page int, frame *render.Frame, enc encodedPage) {
+func (v *Viewer) storePNGAt(doc uint64, page int, frame *render.Frame, enc encodedPage) {
 	v.pngMu.Lock()
 	defer v.pngMu.Unlock()
 	if v.pngCache == nil {
 		v.pngCache = make(map[pngKey]encodedPage)
 	}
-	k := pngKey{page, frame.Width, frame.Height}
+	k := pngKey{doc, page, frame.Width, frame.Height}
 	delete(v.pngPending, k)
 	if _, exists := v.pngCache[k]; exists {
 		return

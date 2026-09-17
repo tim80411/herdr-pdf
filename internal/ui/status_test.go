@@ -77,3 +77,29 @@ func TestStatusLineNarrowPane(t *testing.T) {
 		t.Errorf("StatusLine width = %d, want <= %d", w, cols-1)
 	}
 }
+
+func TestTruncateKeepTail(t *testing.T) {
+	cases := []struct {
+		name     string
+		s        string
+		maxWidth int
+		want     string
+	}{
+		{"fits", "abc", 3, "abc"},
+		{"keeps the tail", "/home/user/deep/dir", 10, "…/deep/dir"},
+		{"zero width", "abc", 0, ""},
+		{"width one always ellipsis", "abcdef", 1, "…"},
+		{"cjk keeps the last two wide runes", "招生資料簡章", 5, "…簡章"}, // budget=4 after the ellipsis: 簡(2)+章(2)
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := TruncateKeepTail(c.s, c.maxWidth)
+			if got != c.want {
+				t.Errorf("TruncateKeepTail(%q, %d) = %q, want %q", c.s, c.maxWidth, got, c.want)
+			}
+			if w := DisplayWidth(got); w > c.maxWidth && c.maxWidth >= 0 {
+				t.Errorf("result %q has display width %d > %d", got, w, c.maxWidth)
+			}
+		})
+	}
+}

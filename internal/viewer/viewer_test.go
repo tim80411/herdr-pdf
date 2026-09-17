@@ -193,12 +193,12 @@ func TestPNGCacheEvictsOldestAndKeysOnSize(t *testing.T) {
 	frame := func(w, h int) *render.Frame { return &render.Frame{Width: w, Height: h} }
 
 	for p := 0; p < pngCacheCap+2; p++ {
-		v.storePNGAt(p, frame(100, 200), encodedPage{full: render.Encoded{Payload: []byte{byte(p)}}})
+		v.storePNGAt(0, p, frame(100, 200), encodedPage{full: render.Encoded{Payload: []byte{byte(p)}}})
 	}
 	if len(v.pngCache) != pngCacheCap {
 		t.Fatalf("cache holds %d entries, want cap %d", len(v.pngCache), pngCacheCap)
 	}
-	if _, ok := v.pngCache[pngKey{0, 100, 200}]; ok {
+	if _, ok := v.pngCache[pngKey{0, 0, 100, 200}]; ok {
 		t.Error("oldest entry should have been evicted")
 	}
 
@@ -397,25 +397,25 @@ func TestSendRefineSkipsAStalePage(t *testing.T) {
 
 func TestReservePNGClaimsASlotBeforeEncoding(t *testing.T) {
 	v := &Viewer{}
-	if !v.reservePNG(2, 800, 600) {
+	if !v.reservePNG(0, 2, 800, 600) {
 		t.Fatal("the first claim on a free slot must succeed")
 	}
-	if v.reservePNG(2, 800, 600) {
+	if v.reservePNG(0, 2, 800, 600) {
 		t.Error("a second prefetch must see the claim and skip the encode")
 	}
-	if !v.reservePNG(2, 400, 300) {
+	if !v.reservePNG(0, 2, 400, 300) {
 		t.Error("a different frame size is a different slot and must be claimable")
 	}
 
 	// A failed encode releases the claim so the page can be retried.
-	v.releasePNG(2, 800, 600)
-	if !v.reservePNG(2, 800, 600) {
+	v.releasePNG(0, 2, 800, 600)
+	if !v.reservePNG(0, 2, 800, 600) {
 		t.Error("a released claim must be reusable")
 	}
 
 	// Storing the result clears the claim and blocks further encodes.
-	v.storePNGAt(2, &render.Frame{Width: 800, Height: 600}, encodedPage{})
-	if v.reservePNG(2, 800, 600) {
+	v.storePNGAt(0, 2, &render.Frame{Width: 800, Height: 600}, encodedPage{})
+	if v.reservePNG(0, 2, 800, 600) {
 		t.Error("an already-encoded frame must not be claimable")
 	}
 	v.pngMu.Lock()
@@ -434,7 +434,7 @@ func TestReservePNGUnderConcurrentPrefetch(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if v.reservePNG(7, 1000, 1400) {
+			if v.reservePNG(0, 7, 1000, 1400) {
 				claims.Add(1)
 			}
 		}()
@@ -612,6 +612,13 @@ func (f *fakeStream) Close() error {
 	return nil
 }
 
+// closeCount reports how many times the stream was closed.
+func (f *fakeStream) closeCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.closes
+}
+
 func (f *fakeStream) snapshot() ([]string, []int, int, int) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -717,3 +724,146 @@ func TestConnectionErrorStillClosesTheStreamAndFallsBack(t *testing.T) {
 
 // The real session must satisfy the interface the send path is written against.
 var _ frameSink = (*herdr.StreamSession)(nil)
+
+// readLog returns everything the viewer wrote to its log file.
+func readLog(t *testing.T, path string) string {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	return string(data)
+}
+
+func TestBrowseOnlyQuitDoesNotCallGraphicsClear(t *testing.T) {
+	// A pane that only ever browsed has no layer: graphics were never
+	// started, so there is nothing to clear and herdr rejects the call
+	// (invalid_layer_id). Pointing the socket at nothing makes any attempt
+	// fail loudly, so the log is proof the call was skipped.
+	t.Setenv("HERDR_SOCKET_PATH", filepath.Join(t.TempDir(), "absent.sock"))
+	logPath := filepath.Join(t.TempDir(), "viewer.log")
+	term, buf := fakeScreen(t)
+
+	v := &Viewer{term: term, opts: Options{PaneID: "w1:p1", LogPath: logPath}}
+	v.logf = openLog(logPath)
+	v.shutdown()
+	v.logf.Close()
+
+	if got := readLog(t, logPath); strings.Contains(got, "graphics.clear") {
+		t.Errorf("shutdown called graphics.clear with no layer; log said:\n%s", got)
+	}
+	assertRestored(t, buf.String())
+}
+
+func TestReadingQuitStillClearsItsLayer(t *testing.T) {
+	// The other half of the guard: once a layer exists, shutdown must still
+	// try to clear it. The socket is absent, so the attempt shows up as a
+	// logged failure rather than silence.
+	t.Setenv("HERDR_SOCKET_PATH", filepath.Join(t.TempDir(), "absent.sock"))
+	logPath := filepath.Join(t.TempDir(), "viewer.log")
+	term, _ := fakeScreen(t)
+
+	v := &Viewer{term: term, opts: Options{PaneID: "w1:p1", LogPath: logPath}, layerID: "page"}
+	v.logf = openLog(logPath)
+	v.shutdown()
+	v.logf.Close()
+
+	if got := readLog(t, logPath); !strings.Contains(got, "final graphics.clear") {
+		t.Errorf("shutdown skipped the clear for an existing layer; log said:\n%s", got)
+	}
+}
+
+func TestReadingHelpOverlayReleasesAndReopensTheStream(t *testing.T) {
+	// The graphics layer composites above text, so the page image has to be
+	// handed back while the key table is up, and restored when it goes.
+	t.Setenv("HERDR_SOCKET_PATH", filepath.Join(t.TempDir(), "absent.sock"))
+	logPath := filepath.Join(t.TempDir(), "viewer.log")
+	term, _ := fakeScreen(t)
+	stream := &fakeStream{}
+
+	v := &Viewer{
+		term:          term,
+		opts:          Options{PaneID: "w1:p1", LogPath: logPath, PDFPath: "/tmp/x.pdf"},
+		layerID:       "page",
+		stream:        stream,
+		graphicsReady: true,
+	}
+	v.logf = openLog(logPath)
+	defer v.logf.Close()
+
+	if quit := v.handleKey(ui.KeyEvent{Key: ui.KeyRune, Rune: '?'}); quit {
+		t.Fatal("? quit the viewer")
+	}
+	if !v.helping {
+		t.Fatal("? did not open the overlay")
+	}
+	if v.stream != nil {
+		t.Error("the frame stream is still open while the overlay is up")
+	}
+	if stream.closeCount() != 1 {
+		t.Errorf("stream closes = %d, want 1", stream.closeCount())
+	}
+	if v.graphicsReady {
+		t.Error("graphicsReady stayed set, so the stream would not be reopened")
+	}
+
+	// Any key returns to the page and asks for a redraw.
+	if quit := v.handleKey(ui.KeyEvent{Key: ui.KeyRune, Rune: 'q'}); quit {
+		t.Fatal("q during the overlay quit the viewer; it should only close the table")
+	}
+	if v.helping {
+		t.Fatal("the overlay stayed up")
+	}
+	if !v.needRedraw {
+		t.Error("closing the overlay did not request a redraw")
+	}
+	// startGraphics ran: with no socket the stream open fails and the
+	// transport falls back, which is logged either way.
+	if got := readLog(t, logPath); !strings.Contains(got, "transport=") {
+		t.Errorf("graphics were not restarted after the overlay; log said:\n%s", got)
+	}
+}
+
+func TestReadingHelpOverlayDrawsTheKeyTableAndEOFStillQuits(t *testing.T) {
+	term, buf := fakeScreen(t)
+	v := &Viewer{term: term, opts: Options{PDFPath: "/tmp/x.pdf"}, helping: true}
+
+	v.fullRedraw()
+	out := buf.String()
+	for _, want := range []string{"閱讀模式鍵位", "按任意鍵返回", "回到瀏覽模式"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the overlay is missing %q", want)
+		}
+	}
+
+	if quit := v.handleKey(ui.KeyEvent{Key: ui.KeyEOF}); !quit {
+		t.Error("EOF during the overlay did not quit")
+	}
+}
+
+func TestReadingStatusHintsComeFromTheKeyTable(t *testing.T) {
+	hints := readingHelp.StatusHints()
+	for _, want := range []string{"j/k 翻頁", "? 說明", "q 離開"} {
+		if !strings.Contains(hints, want) {
+			t.Errorf("status hints %q are missing %q", hints, want)
+		}
+	}
+	// The status row shares its width with the filename and the render
+	// diagnostics, so the hint set stays short enough to leave the filename
+	// readable at a normal split width.
+	if w := ui.DisplayWidth(hints); w > 30 {
+		t.Errorf("status hints are %d columns wide: %q — too wide for the row", w, hints)
+	}
+	// Keys documented only on the overlay must not leak into the row.
+	for _, quiet := range []string{"o 瀏覽", "g/G 首尾"} {
+		if strings.Contains(hints, quiet) {
+			t.Errorf("hint %q belongs on the overlay, not the status row", quiet)
+		}
+	}
+	// Every hint must correspond to a real binding in the table.
+	for _, b := range readingHelp.Bindings {
+		if b.Hint != "" && !strings.Contains(hints, b.Hint) {
+			t.Errorf("binding %q declares hint %q but it is not in the status line", b.Keys, b.Hint)
+		}
+	}
+}

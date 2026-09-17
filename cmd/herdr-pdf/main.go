@@ -25,7 +25,7 @@ import (
 // version is bumped independently of herdr-plugin.toml's manifest version;
 // it identifies this binary for viewer.log / bug reports. A release build
 // overrides it with -ldflags "-X main.version=...".
-var version = "0.2.0"
+var version = "0.3.0"
 
 const usage = `usage: herdr-pdf <command> [args]
 
@@ -66,8 +66,12 @@ func runView(args []string) int {
 	}
 	opts := viewer.Options{
 		PDFPath: pdfPath,
-		PaneID:  os.Getenv("HERDR_PANE_ID"),
-		LogPath: viewer.LogPath(),
+		// Where browser mode starts when no file was named. Nothing expands
+		// "~" on the way in: the value arrives through --env or a manifest,
+		// neither of which goes through a shell.
+		StartDir: expandHome(os.Getenv("PDFVIEW_DIR")),
+		PaneID:   os.Getenv("HERDR_PANE_ID"),
+		LogPath:  viewer.LogPath(),
 		// Both knobs are read here rather than inside the viewer package so
 		// Run() stays testable without a real pane or a mutated environment.
 		Transport:   viewer.ParseTransport(os.Getenv("HERDR_PDF_TRANSPORT")),
@@ -88,6 +92,27 @@ func runView(args []string) int {
 	return 0
 }
 
+// tuningEnvNames are the viewer knobs forwarded into any pane this process
+// opens. `herdr plugin pane open` builds the new pane's environment from
+// the manifest and --env flags, not from this process's environment, so
+// without forwarding an operator setting HERDR_PDF_TRANSPORT in their shell
+// would see it silently ignored by the pane they just opened.
+var tuningEnvNames = []string{"HERDR_PDF_TRANSPORT", "HERDR_PDF_TRACE", "HERDR_PDF_MAX_FRAME_KB", "HERDR_PDF_PROGRESSIVE"}
+
+// expandHome resolves a leading "~". Nothing expands it on the way in: the
+// value arrives through --env or a manifest, neither of which goes through
+// a shell.
+func expandHome(path string) string {
+	if path != "~" && !strings.HasPrefix(path, "~/") {
+		return path
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return path
+	}
+	return filepath.Join(home, strings.TrimPrefix(strings.TrimPrefix(path, "~"), "/"))
+}
+
 // runOpen is the [[actions]] "open" / link_handler entrypoint. It resolves
 // a path (see internal/openpath) and execs `herdr plugin pane open` to
 // launch a "view" pane, rather than spawning a child, so this short-lived
@@ -102,12 +127,19 @@ func runOpen(args []string) int {
 		cwd = "."
 	}
 
+	contextJSON := os.Getenv("HERDR_PLUGIN_CONTEXT_JSON")
 	resolved, err := openpath.Resolve(
 		argvPath,
 		os.Getenv("HERDR_PLUGIN_CLICKED_URL"),
-		os.Getenv("HERDR_PLUGIN_CONTEXT_JSON"),
+		contextJSON,
 		cwd,
 	)
+	// Nothing offered at all — a keybinding pressed with no selection, which
+	// is the usual case since a selection made in the outer terminal
+	// emulator never reaches herdr. Browse instead of erroring out.
+	if errors.Is(err, openpath.ErrNoCandidate) {
+		return openBrowser(openpath.ParseContext(contextJSON), cwd)
+	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "herdr-pdf open: could not resolve a PDF path: %v\n", err)
 		return 1
@@ -124,18 +156,8 @@ func runOpen(args []string) int {
 		return 1
 	}
 
-	herdrBin := os.Getenv("HERDR_BIN_PATH")
-	if herdrBin == "" {
-		herdrBin = "herdr"
-	}
-	binPath, lerr := exec.LookPath(herdrBin)
-	if lerr != nil {
-		fmt.Fprintf(os.Stderr, "herdr-pdf open: cannot find %q in PATH: %v\n", herdrBin, lerr)
-		return 1
-	}
-
 	cmdArgs := []string{
-		herdrBin, "plugin", "pane", "open",
+		"plugin", "pane", "open",
 		"--plugin", "pdf",
 		"--entrypoint", "view",
 		"--placement", "split",
@@ -143,22 +165,66 @@ func runOpen(args []string) int {
 		"--env", "PDFVIEW_FILE=" + resolved,
 		"--focus",
 	}
-	// Forward the viewer's own tuning knobs into the new pane. `herdr
-	// plugin pane open` builds the pane's environment from the manifest and
-	// these --env flags, not from this process's environment, so without
-	// this an operator setting HERDR_PDF_TRANSPORT in their shell would see
-	// it silently ignored by the pane they just opened.
-	for _, name := range []string{"HERDR_PDF_TRANSPORT", "HERDR_PDF_TRACE", "HERDR_PDF_MAX_FRAME_KB", "HERDR_PDF_PROGRESSIVE"} {
+	cmdArgs = appendTuningEnv(cmdArgs)
+	if paneID := os.Getenv("HERDR_PANE_ID"); paneID != "" {
+		cmdArgs = append(cmdArgs, "--target-pane", paneID)
+	}
+	return execHerdr("open", cmdArgs)
+}
+
+// openBrowser is runOpen's fallback: the same "view" pane, opened with a
+// directory instead of a file so the viewer comes up in browser mode. There
+// is no separate picker entrypoint — browsing and reading are two modes of
+// one pane, so choosing a file does not have to open a second one.
+func openBrowser(ctx openpath.Context, cwd string) int {
+	dir := ctx.FocusedPaneCwd
+	if dir == "" {
+		dir = ctx.WorkspaceCwd
+	}
+	if dir == "" {
+		dir = cwd
+	}
+	cmdArgs := []string{
+		"plugin", "pane", "open",
+		"--plugin", "pdf",
+		"--entrypoint", "view",
+		"--placement", "split",
+		"--direction", "right",
+		"--env", "PDFVIEW_DIR=" + dir,
+		"--focus",
+	}
+	if ctx.FocusedPaneID != "" {
+		cmdArgs = append(cmdArgs, "--target-pane", ctx.FocusedPaneID)
+	}
+	cmdArgs = appendTuningEnv(cmdArgs)
+	return execHerdr("open", cmdArgs)
+}
+
+// appendTuningEnv adds --env flags for whichever tuning knobs are set here.
+func appendTuningEnv(cmdArgs []string) []string {
+	for _, name := range tuningEnvNames {
 		if val := os.Getenv(name); val != "" {
 			cmdArgs = append(cmdArgs, "--env", name+"="+val)
 		}
 	}
-	if paneID := os.Getenv("HERDR_PANE_ID"); paneID != "" {
-		cmdArgs = append(cmdArgs, "--target-pane", paneID)
-	}
+	return cmdArgs
+}
 
-	if execErr := syscall.Exec(binPath, cmdArgs, os.Environ()); execErr != nil {
-		fmt.Fprintf(os.Stderr, "herdr-pdf open: exec %s failed: %v\n", binPath, execErr)
+// execHerdr replaces this process with a herdr CLI invocation, so the
+// short-lived action process doesn't linger behind the pane it opened.
+// args excludes argv[0]. It returns only on failure.
+func execHerdr(what string, args []string) int {
+	herdrBin := os.Getenv("HERDR_BIN_PATH")
+	if herdrBin == "" {
+		herdrBin = "herdr"
+	}
+	binPath, lerr := exec.LookPath(herdrBin)
+	if lerr != nil {
+		fmt.Fprintf(os.Stderr, "herdr-pdf %s: cannot find %q in PATH: %v\n", what, herdrBin, lerr)
+		return 1
+	}
+	if execErr := syscall.Exec(binPath, append([]string{herdrBin}, args...), os.Environ()); execErr != nil {
+		fmt.Fprintf(os.Stderr, "herdr-pdf %s: exec %s failed: %v\n", what, binPath, execErr)
 		return 1
 	}
 	return 0 // unreachable when exec succeeds

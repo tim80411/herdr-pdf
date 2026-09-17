@@ -43,6 +43,35 @@ func TruncateToWidth(s string, maxWidth int) string {
 	return b.String() + "…"
 }
 
+// TruncateKeepTail truncates s to at most maxWidth display columns by
+// dropping runes from the front, marking the cut with a leading ellipsis.
+// It is the right direction for a path or a line being typed: the deepest
+// directory and the caret are the parts worth keeping.
+func TruncateKeepTail(s string, maxWidth int) string {
+	if maxWidth <= 0 {
+		return ""
+	}
+	if DisplayWidth(s) <= maxWidth {
+		return s
+	}
+	if maxWidth == 1 {
+		return "…"
+	}
+	budget := maxWidth - 1 // reserve 1 column for "…"
+	runes := []rune(s)
+	width := 0
+	cut := len(runes)
+	for i := len(runes) - 1; i >= 0; i-- {
+		w := runewidth.RuneWidth(runes[i])
+		if width+w > budget {
+			break
+		}
+		width += w
+		cut = i
+	}
+	return "…" + string(runes[cut:])
+}
+
 // StatusLine lays out the bottom row's content (without paint escapes — see
 // RenderStatusLine): name (left, truncated to fit), mid (center — page
 // indicator + key hints), right (render/stream diagnostics), padded to
@@ -79,4 +108,11 @@ func StatusLine(name, mid, right string, cols int) string {
 // reverse video on, text, SGR reset.
 func RenderStatusLine(row int, line string) string {
 	return fmt.Sprintf("\x1b[%d;1H\x1b[2K%s%s%s", row, reverseVideo, line, resetSGR)
+}
+
+// Reverse wraps s in reverse video, for the selected row of a list. It
+// keeps every SGR escape in this package rather than spreading raw
+// sequences across callers.
+func Reverse(s string) string {
+	return reverseVideo + s + resetSGR
 }

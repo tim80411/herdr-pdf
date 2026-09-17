@@ -35,7 +35,7 @@ herdr plugin enable pdf   # 若沒有自動啟用
 
 | 情境 | 怎麼做 |
 | --- | --- |
-| 指定版本 | `herdr plugin install tim80411/herdr-pdf --ref v0.2.0` |
+| 指定版本 | `herdr plugin install tim80411/herdr-pdf --ref v0.3.0` |
 | 升級 | 重新執行一次 `herdr plugin install tim80411/herdr-pdf`（herdr 沒有獨立的 update 子命令） |
 | 這台機器先前用 `link` 掛過 | 先 `herdr plugin unlink pdf`，再 install |
 
@@ -60,7 +60,7 @@ herdr plugin enable pdf
    ```sh
    herdr plugin action invoke open --plugin pdf
    ```
-   要注意：action id 是 `open`，plugin 要另外用 `--plugin pdf` 指定，**不是**單一字串 `pdf.open`（用 `herdr plugin action list --plugin pdf` 可以看到回傳的是 `"action_id":"open"` 搭配獨立的 `"plugin_id":"pdf"`）。這個子命令的 `--help` 只列出 `--plugin <ID>` 一個選項，沒有能夾帶檔案路徑的位置參數，所以手動下這行指令時，PDF 路徑要靠 herdr 幫這次 action 準備好的點擊內容（`HERDR_PLUGIN_CLICKED_URL` 或 context JSON）才能解出來；日常操作建議用方式 1 或 2，這個方式比較適合已經有點擊上下文的場景。
+   要注意：action id 是 `open`，plugin 要另外用 `--plugin pdf` 指定，**不是**單一字串 `pdf.open`（用 `herdr plugin action list --plugin pdf` 可以看到回傳的是 `"action_id":"open"` 搭配獨立的 `"plugin_id":"pdf"`）。這個子命令的 `--help` 只列出 `--plugin <ID>` 一個選項，沒有能夾帶檔案路徑的位置參數，所以 PDF 路徑要靠 herdr 幫這次 action 準備好的點擊內容（`HERDR_PLUGIN_CLICKED_URL` 或 context JSON）才能解出來；解不出來時不會失敗，而是開一個瀏覽模式的窗格讓你挑檔案（見下一節）。
 
 ## 快捷鍵
 
@@ -75,7 +75,31 @@ description = "open selected PDF path in a split pane"
 ```
 
 - 這裡的 `command` 要寫成合併字串 `<plugin id>.<action id>`，所以是 `pdf.open`——跟前一節 CLI 的 `herdr plugin action invoke` 要拆成 `open --plugin pdf` 兩個獨立參數是不同格式，兩處介面不同，別弄混。
-- 按下快捷鍵時，action 讀 herdr 準備好的 context：先看目前選取的文字（`selected_text`）是不是 `.pdf` 路徑，相對路徑會以觸發當下那個 pane 的 cwd 補成絕對路徑；沒有選取任何文字就會找不到路徑，窗格開不起來。
+- 按下快捷鍵時，action 讀 herdr 準備好的 context：先看目前選取的文字（`selected_text`）是不是 `.pdf` 路徑，相對路徑會以觸發當下那個 pane 的 cwd 補成絕對路徑。
+- **沒有選取文字時，窗格會直接開在「瀏覽模式」**：一樣是右側那個 split 窗格，但先不載入 PDF，而是顯示路徑列＋目錄清單讓你挑。在外層終端機（Ghostty 等）用滑鼠選的文字 herdr 看不到，所以瀏覽模式才是按快捷鍵的日常路徑。
+- 只有「完全沒有候選路徑」才會進瀏覽模式；選到的是非 `.pdf` 檔、遠端 `file://` 位址或不存在的檔案，仍然直接報錯。
+
+### 瀏覽模式鍵位
+
+第一行是路徑列（目前目錄的絕對路徑，太長會從前面截掉、保留尾端），中間是目錄清單（子目錄在前、尾綴 `/`，再列 `.pdf`，各自依名稱排序），最後一行是狀態列（`n/m`、過濾字串、鍵位提示）。瀏覽模式是純文字，不會動到繪圖層；選到 PDF 後同一個窗格才切換成閱讀模式並開串流。
+
+鍵位是 fzf 風格：**打字優先**，沒有任何字母被拿去當指令，所以任何檔名都篩得到。
+
+| 按鍵 | 動作 |
+| --- | --- |
+| 任何可列印字元（含中文） | 即時過濾（不分大小寫的子字串比對） |
+| `Backspace` | 刪一個字；**過濾字串已空時＝回上一層**（游標會停在剛離開的那個目錄） |
+| `↑`／`↓`、`Ctrl-p`／`Ctrl-n`、`Ctrl-k`／`Ctrl-j` | 上下移動 |
+| `Enter` | 進入目錄，或開啟 PDF |
+| `Esc` | 有過濾字就清除，沒有就離開（兩段語意） |
+| `Tab` | 進入路徑編輯（見下） |
+| `Ctrl-h` | 切換顯示隱藏項（`.` 開頭，預設不列） |
+| `?` | 顯示鍵位說明（任意鍵返回） |
+| `Ctrl-c` | 直接離開 |
+
+兩個模式的狀態列右段都有 `? 說明`；按 `?` 會蓋上一張鍵位表，按任意鍵返回。表的內容由程式裡的鍵位資料結構產生（`internal/browser` 與 `internal/viewer` 各一份 `ui.HelpTable`），狀態列提示也出自同一份，所以這兩張 README 表格只要跟著它對齊就不會有文件與程式不同步的問題。
+
+路徑編輯（`Tab` 進入，欄位是空的）：直接打絕對路徑、相對路徑或 `~` 開頭的路徑；再按 `Tab` 補全（候選只含目錄與 `.pdf`，多個候選時補到共同前綴，並在狀態列列出前幾個）；`Enter` 跳到該目錄或直接開該 PDF；`Esc` 取消回清單；`Ctrl-c` 離開。
 - 改完 `~/.config/herdr/config.toml` 要跑 `herdr server reload-config` 才會生效。
 
 ## 鍵位
@@ -88,6 +112,8 @@ description = "open selected PDF path in a split pane"
 | `G` | 若已經先輸入數字就跳到該頁，否則跳到最後一頁 |
 | `0`-`9` 接 `G` 或 Enter | 跳到第 N 頁（超出範圍會夾到頭或尾） |
 | `r` | 強制重繪（畫面出現殘影時用） |
+| `o` | 回到瀏覽模式（目錄設為目前檔案所在目錄，游標停在該檔） |
+| `?` | 顯示鍵位說明（任意鍵返回） |
 | `q`、`Ctrl-C` | 離開 |
 
 ## 設定
@@ -98,8 +124,9 @@ description = "open selected PDF path in a split pane"
 | `HERDR_PDF_MAX_FRAME_KB` | 正整數 | 遠端 200 KB／本機 1500 KB（自動判斷） | 覆寫單張畫面的位元組預算 |
 | `HERDR_PDF_PROGRESSIVE` | `1`/`0`（也接受 true/false/yes/no/on/off） | 依連線是否遠端自動決定 | 強制開關漸進式預覽 |
 | `HERDR_PDF_TRACE` | `1`/`true`/`yes`/`on` | 關閉 | 把每次重繪各階段的耗時寫進 `viewer.log` |
+| `PDFVIEW_DIR` | 目錄路徑 | 行程自己的工作目錄 | 沒有給 `PDFVIEW_FILE` 時，瀏覽模式從哪個目錄開始 |
 
-這四個變數都會被 `open` 動作轉發進新開的 pane，所以直接下 `HERDR_PDF_TRACE=1 ./bin/herdr-pdf open file.pdf` 也有效。
+前四個變數都會被 `open` 動作轉發進新開的 pane，所以直接下 `HERDR_PDF_TRACE=1 ./bin/herdr-pdf open file.pdf` 也有效。`PDFVIEW_DIR` 則是 `open` 在解不出路徑時自己帶上的：值取觸發那個 pane 的 cwd。
 
 `stream-rgba` 是舊版直接傳未壓縮 RGBA 的做法；`direct` 會把 RGBA 寫進 `pane.graphics.info` 回報的 `file_frame_directory`、只送檔案路徑換取 herdr 的零複製傳輸，但只有在圖層是 `primary` 且用戶端已握手出 `direct-kitty` 時才會生效，握手沒成功就自動退回 `stream-png`；`set` 每頁各發一次 `pane.graphics.set`，硬上限 512 KiB（實際保留一點緩衝，卡在 500 KiB 左右），太大會自動縮圖重試——串流連不上或中途斷線時，viewer 也會自動退回這條路。
 
@@ -225,7 +252,7 @@ herdr plugin enable pdf   # if it doesn't come up enabled
 
 `[[build]]` runs `./build.sh`, which downloads a version- and platform-matched, SHA-256-verified prebuilt binary from the GitHub release first, and only falls back to a local `go build` on a miss (no network, no matching release, checksum failure). For plugin development, use `herdr plugin link /path/to/herdr-pdf` instead so rebuilds pick up local source changes.
 
-Pin a version with `--ref v0.2.0`; to upgrade, just re-run `herdr plugin install tim80411/herdr-pdf` (herdr has no separate update subcommand). If this machine previously had the plugin linked, run `herdr plugin unlink pdf` first.
+Pin a version with `--ref v0.3.0`; to upgrade, just re-run `herdr plugin install tim80411/herdr-pdf` (herdr has no separate update subcommand). If this machine previously had the plugin linked, run `herdr plugin unlink pdf` first.
 
 ### Usage
 
@@ -233,6 +260,29 @@ Pin a version with `--ref v0.2.0`; to upgrade, just re-run `herdr plugin install
 - Or run the opener binary directly: `./bin/herdr-pdf open /path/to/file.pdf`
 - Or invoke the action through herdr's CLI: `herdr plugin action invoke open --plugin pdf` — note the action id is `open` with a separate `--plugin pdf` flag, not a combined `pdf.open`. This form has no CLI slot for a file path, so it depends on herdr's own click context to resolve one; prefer the two options above for everyday use.
 - Or bind a key in herdr's `config.toml` (`[[keys.command]]`, `type = "plugin_action"`, `command = "pdf.open"` — the combined `<plugin>.<action>` form, unlike the CLI's separate `open --plugin pdf`); it opens whatever `.pdf` path is currently selected in the pane, resolved against that pane's cwd. Run `herdr server reload-config` after editing.
+- With nothing selected, the pane opens in **browser mode** instead of failing: the same split pane, but showing a path bar and a directory listing rather than a document. A selection made in the outer terminal emulator never reaches herdr, so browser mode is the everyday path for the keybinding. A real error — a non-PDF, a remote `file://` host, a missing file — still reports itself rather than falling back.
+
+### Browser mode keys
+
+Row 1 is the path bar (the current directory, truncated from the front so its deep end stays visible); the middle is the listing (subdirectories first with a trailing `/`, then `.pdf` files, each sorted by name); the last row is the status line (`n/m`, the filter, the key hints). Browsing is plain text and touches no graphics layer — the same pane switches to reading mode and opens the frame stream only once a file is chosen.
+
+The keymap is fzf-style: **typing wins**, no letter is reserved for navigation, so every filename is reachable by filter.
+
+| Key | Action |
+| --- | --- |
+| Any printable character (CJK included) | Filter as you type (case-insensitive substring) |
+| `Backspace` | Delete one character; **with the filter already empty, go up one level** (the cursor lands on the directory just left) |
+| `↑`/`↓`, `Ctrl-p`/`Ctrl-n`, `Ctrl-k`/`Ctrl-j` | Move |
+| `Enter` | Enter a directory, or open a PDF |
+| `Esc` | Clear the filter if there is one, otherwise quit |
+| `Tab` | Edit the path bar (below) |
+| `Ctrl-h` | Toggle hidden entries (dot-names, omitted by default) |
+| `?` | Show the key table (any key returns) |
+| `Ctrl-c` | Quit outright |
+
+Both modes carry `? 說明` on the status row; `?` overlays a key table that any key dismisses. The table is generated from the keymap declared in code (one `ui.HelpTable` each in `internal/browser` and `internal/viewer`), and the status-line hints come from the same declaration, so these README tables only have to agree with it.
+
+Path editing (`Tab`, starting from an empty field): type an absolute, relative, or `~`-rooted path; press `Tab` again to complete (candidates are directories and PDFs; several of them complete to the shared prefix and the first few are listed on the status row); `Enter` goes there or opens the file; `Esc` returns to the listing; `Ctrl-c` quits.
 
 ### Keys
 
@@ -244,6 +294,8 @@ Pin a version with `--ref v0.2.0`; to upgrade, just re-run `herdr plugin install
 | `G` | Jump to the typed page number, or last page if none was typed |
 | digits then `G` or Enter | Jump to page N |
 | `r` | Force redraw |
+| `o` | Back to browser mode, on this file's directory with the cursor on it |
+| `?` | Show the key table (any key returns) |
 | `q`, `Ctrl-C` | Quit |
 
 ### Environment variables
@@ -254,6 +306,7 @@ Pin a version with `--ref v0.2.0`; to upgrade, just re-run `herdr plugin install
 | `HERDR_PDF_MAX_FRAME_KB` | positive integer | 200 KB remote / 1500 KB local (auto-detected) | Override the per-frame byte budget |
 | `HERDR_PDF_PROGRESSIVE` | `1`/`0` (also true/false/yes/no/on/off) | auto (on for remote sessions) | Force progressive preview on or off |
 | `HERDR_PDF_TRACE` | `1`/`true`/`yes`/`on` | off | Log per-stage timing to `viewer.log` |
+| `PDFVIEW_DIR` | a directory path | the process's cwd | Where browser mode starts when no `PDFVIEW_FILE` was given |
 
 ### License
 

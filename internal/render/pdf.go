@@ -145,6 +145,13 @@ func (r *Renderer) Open(path string) error {
 	if err != nil {
 		return fmt.Errorf("read %s: %w", path, err)
 	}
+	// Reopening is how browser mode switches files within one process. The
+	// previous document has to be released and its rasters dropped: the
+	// cache is keyed by page index and size, not by file, so a survivor
+	// would be served as a page of the new document.
+	r.closeDoc()
+	r.resetCache()
+
 	r.pdfBytes = data
 	doc, err := r.inst.OpenDocument(&requests.OpenDocument{File: &r.pdfBytes})
 	if err != nil {
@@ -161,6 +168,28 @@ func (r *Renderer) Open(path string) error {
 	}
 	r.pageCount = countResp.PageCount
 	return nil
+}
+
+// closeDoc releases the open document, if there is one. It takes renderMu
+// so a prefetch still inside pdfium finishes before the document goes away.
+func (r *Renderer) closeDoc() {
+	r.renderMu.Lock()
+	defer r.renderMu.Unlock()
+	if r.doc == nil {
+		return
+	}
+	r.inst.FPDF_CloseDocument(&requests.FPDF_CloseDocument{Document: *r.doc})
+	r.doc = nil
+	r.pageCount = 0
+}
+
+// resetCache drops every cached raster. storeLocked recreates the map, so a
+// render already in flight can still store its result.
+func (r *Renderer) resetCache() {
+	r.cacheMu.Lock()
+	defer r.cacheMu.Unlock()
+	r.cache = nil
+	r.cacheKeys = nil
 }
 
 // PageCount returns the number of pages in the open document.
@@ -263,12 +292,10 @@ func (r *Renderer) Cached(index, maxW, maxH int) bool {
 // on renderMu so an in-flight Prefetch finishes before the document under
 // it is torn down.
 func (r *Renderer) Close() error {
+	r.closeDoc()
 	r.renderMu.Lock()
 	r.closed = true
 	r.renderMu.Unlock()
-	if r.doc != nil {
-		r.inst.FPDF_CloseDocument(&requests.FPDF_CloseDocument{Document: *r.doc})
-	}
 	if r.inst != nil {
 		r.inst.Close()
 	}

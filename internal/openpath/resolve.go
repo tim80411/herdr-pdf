@@ -5,11 +5,18 @@ package openpath
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"path/filepath"
 	"strings"
 )
+
+// ErrNoCandidate reports that nothing at all was offered to resolve — no
+// argv, no clicked URL, no selection. Callers distinguish it from a real
+// failure (a non-PDF, a remote host, a missing file) because "nothing was
+// selected" is the case worth offering a file picker for.
+var ErrNoCandidate = errors.New("no candidate path found (no arg, no clicked_url, no selected_text)")
 
 // Context mirrors the fields this package reads out of
 // $HERDR_PLUGIN_CONTEXT_JSON; herdr documents more fields than this, but
@@ -17,7 +24,20 @@ import (
 type Context struct {
 	ClickedURL     string `json:"clicked_url"`
 	SelectedText   string `json:"selected_text"`
+	FocusedPaneID  string `json:"focused_pane_id"`
 	FocusedPaneCwd string `json:"focused_pane_cwd"`
+	WorkspaceCwd   string `json:"workspace_cwd"`
+}
+
+// ParseContext decodes $HERDR_PLUGIN_CONTEXT_JSON. Empty or malformed JSON
+// yields a zero Context rather than an error: herdr omits the variable
+// entirely for some invocation sources, and every field is optional.
+func ParseContext(contextJSON string) Context {
+	var ctx Context
+	if contextJSON != "" {
+		_ = json.Unmarshal([]byte(contextJSON), &ctx)
+	}
+	return ctx
 }
 
 // stripFileURL turns a file:// URL into a filesystem path. Percent-decoding
@@ -55,10 +75,7 @@ func Resolve(argvPath, clickedURLEnv, contextJSON, cwd string) (string, error) {
 		candidate = clickedURLEnv
 	}
 
-	var ctx Context
-	if contextJSON != "" {
-		_ = json.Unmarshal([]byte(contextJSON), &ctx)
-	}
+	ctx := ParseContext(contextJSON)
 
 	if candidate == "" {
 		candidate = ctx.ClickedURL
@@ -67,7 +84,7 @@ func Resolve(argvPath, clickedURLEnv, contextJSON, cwd string) (string, error) {
 		candidate = ctx.SelectedText
 	}
 	if candidate == "" {
-		return "", fmt.Errorf("no candidate path found (no arg, no clicked_url, no selected_text)")
+		return "", ErrNoCandidate
 	}
 
 	// Only the trailing newline a shell or clipboard adds is stripped;
