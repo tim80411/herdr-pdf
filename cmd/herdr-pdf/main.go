@@ -25,14 +25,15 @@ import (
 // version is bumped independently of herdr-plugin.toml's manifest version;
 // it identifies this binary for viewer.log / bug reports. A release build
 // overrides it with -ldflags "-X main.version=...".
-var version = "0.3.0"
+var version = "0.3.1"
 
 const usage = `usage: herdr-pdf <command> [args]
 
 commands:
-  view [path]   run the PDF viewer in the current pane (reads $PDFVIEW_FILE)
-  open [path]   resolve a PDF path and open it in a new "view" pane
-  version       print build info`
+  view [path]                        run the PDF viewer in the current pane (reads $PDFVIEW_FILE)
+  open [--fallback=system] [path]    resolve a PDF path and open it in a new "view" pane;
+                                      --fallback=system hands a non-.pdf path to the OS opener instead of erroring
+  version                            print build info`
 
 func main() {
 	if len(os.Args) < 2 {
@@ -113,14 +114,62 @@ func expandHome(path string) string {
 	return filepath.Join(home, strings.TrimPrefix(strings.TrimPrefix(path, "~"), "/"))
 }
 
+// openOpts is runOpen's argv, parsed out into a plain struct so the parsing
+// rules are testable without a real os.Args.
+type openOpts struct {
+	fallback string // "" (no fallback) or "system"
+	path     string
+}
+
+// parseOpenArgs reads open's argv. herdr-file-viewer's `O` key spawns the
+// configured opener with the selected file's absolute path appended last,
+// so the path is normally the final argument — but someone typing the
+// command by hand may put it first, so flag position isn't fixed: every
+// "--"-prefixed token is treated as a flag and the last remaining token is
+// the path. Only --fallback=system and --fallback=none (equivalent to
+// omitting the flag) are recognised; anything else is an error.
+func parseOpenArgs(args []string) (openOpts, error) {
+	var opts openOpts
+	for _, a := range args {
+		if !strings.HasPrefix(a, "--") {
+			opts.path = a
+			continue
+		}
+		switch a {
+		case "--fallback=system":
+			opts.fallback = "system"
+		case "--fallback=none":
+			opts.fallback = ""
+		default:
+			return openOpts{}, fmt.Errorf("unknown flag %q", a)
+		}
+	}
+	return opts, nil
+}
+
+// systemOpenerArgv picks the argv for the platform's file-association
+// opener, used to hand off a resolved path that isn't a .pdf instead of
+// rejecting it outright.
+func systemOpenerArgv(goos, path string) ([]string, error) {
+	switch goos {
+	case "darwin":
+		return []string{"open", path}, nil
+	case "linux":
+		return []string{"xdg-open", path}, nil
+	default:
+		return nil, fmt.Errorf("no system opener known for GOOS %q", goos)
+	}
+}
+
 // runOpen is the [[actions]] "open" / link_handler entrypoint. It resolves
 // a path (see internal/openpath) and execs `herdr plugin pane open` to
 // launch a "view" pane, rather than spawning a child, so this short-lived
 // process doesn't linger once the real viewer is launched.
 func runOpen(args []string) int {
-	argvPath := ""
-	if len(args) > 0 {
-		argvPath = args[0]
+	opts, perr := parseOpenArgs(args)
+	if perr != nil {
+		fmt.Fprintf(os.Stderr, "herdr-pdf open: %v\n\n%s\n", perr, usage)
+		return 2
 	}
 	cwd, err := os.Getwd()
 	if err != nil {
@@ -129,7 +178,7 @@ func runOpen(args []string) int {
 
 	contextJSON := os.Getenv("HERDR_PLUGIN_CONTEXT_JSON")
 	resolved, err := openpath.Resolve(
-		argvPath,
+		opts.path,
 		os.Getenv("HERDR_PLUGIN_CLICKED_URL"),
 		contextJSON,
 		cwd,
@@ -146,8 +195,11 @@ func runOpen(args []string) int {
 	}
 	// Checked here rather than in openpath.Resolve: resolution is shared
 	// with callers that legitimately handle other files, but this entrypoint
-	// only ever launches the PDF viewer.
+	// only ever launches the PDF viewer itself.
 	if !strings.EqualFold(filepath.Ext(resolved), ".pdf") {
+		if opts.fallback == "system" {
+			return execSystemOpener(resolved)
+		}
 		fmt.Fprintf(os.Stderr, "herdr-pdf open: not a .pdf file: %s\n", resolved)
 		return 1
 	}
@@ -225,6 +277,29 @@ func execHerdr(what string, args []string) int {
 	}
 	if execErr := syscall.Exec(binPath, append([]string{herdrBin}, args...), os.Environ()); execErr != nil {
 		fmt.Fprintf(os.Stderr, "herdr-pdf %s: exec %s failed: %v\n", what, binPath, execErr)
+		return 1
+	}
+	return 0 // unreachable when exec succeeds
+}
+
+// execSystemOpener hands resolved off to the platform's file-association
+// opener, exec'd in place of this process like execHerdr does for the herdr
+// CLI. Only reached with --fallback=system and a non-.pdf path; unlike the
+// .pdf path, resolved is not stat'd first, so a directory reaches the OS
+// opener too rather than being rejected as "does not exist".
+func execSystemOpener(resolved string) int {
+	argv, aerr := systemOpenerArgv(runtime.GOOS, resolved)
+	if aerr != nil {
+		fmt.Fprintf(os.Stderr, "herdr-pdf open: %v\n", aerr)
+		return 1
+	}
+	binPath, lerr := exec.LookPath(argv[0])
+	if lerr != nil {
+		fmt.Fprintf(os.Stderr, "herdr-pdf open: cannot find %q in PATH: %v\n", argv[0], lerr)
+		return 1
+	}
+	if execErr := syscall.Exec(binPath, argv, os.Environ()); execErr != nil {
+		fmt.Fprintf(os.Stderr, "herdr-pdf open: exec %s failed: %v\n", binPath, execErr)
 		return 1
 	}
 	return 0 // unreachable when exec succeeds

@@ -35,7 +35,7 @@ herdr plugin enable pdf   # 若沒有自動啟用
 
 | 情境 | 怎麼做 |
 | --- | --- |
-| 指定版本 | `herdr plugin install tim80411/herdr-pdf --ref v0.3.0` |
+| 指定版本 | `herdr plugin install tim80411/herdr-pdf --ref v0.3.1` |
 | 升級 | 重新執行一次 `herdr plugin install tim80411/herdr-pdf`（herdr 沒有獨立的 update 子命令） |
 | 這台機器先前用 `link` 掛過 | 先 `herdr plugin unlink pdf`，再 install |
 
@@ -61,6 +61,23 @@ herdr plugin enable pdf
    herdr plugin action invoke open --plugin pdf
    ```
    要注意：action id 是 `open`，plugin 要另外用 `--plugin pdf` 指定，**不是**單一字串 `pdf.open`（用 `herdr plugin action list --plugin pdf` 可以看到回傳的是 `"action_id":"open"` 搭配獨立的 `"plugin_id":"pdf"`）。這個子命令的 `--help` 只列出 `--plugin <ID>` 一個選項，沒有能夾帶檔案路徑的位置參數，所以 PDF 路徑要靠 herdr 幫這次 action 準備好的點擊內容（`HERDR_PLUGIN_CLICKED_URL` 或 context JSON）才能解出來；解不出來時不會失敗，而是開一個瀏覽模式的窗格讓你挑檔案（見下一節）。
+
+## 接到 herdr-file-viewer
+
+`herdr-file-viewer` 是另一個 herdr plugin，按 `O` 鍵會把使用者在它 `config.toml` 設定的 `open` 指令當成 opener 執行，並把目前選取檔案的絕對路徑接在 argv 最後（stdio 全部導向 `/dev/null`，執行結果看不到任何輸出）。`O` 對任何檔案都會觸發、不分是不是 `.pdf`（目錄也算），所以直接把它指到 `herdr-pdf open` 會讓選到非 PDF 檔案時按了沒反應——這正是 `--fallback=system` 存在的原因：解析出的路徑不是 `.pdf` 時改丟給系統 opener（macOS 是 `open`，Linux 是 `xdg-open`），不再印錯誤退出。
+
+在 file-viewer 的 `config.toml`（執行 `herdr plugin config-dir herdr-file-viewer` 可以印出設定檔位置）裡設定：
+
+```toml
+open = "/Users/<you>/.config/herdr/plugins/github/pdf-c35b21d6ca39/bin/herdr-pdf open --fallback=system"
+```
+
+- herdr 外掛的安裝目錄命名是 `<plugin-id>-<sha256(plugin-id) 前 12 碼>`，`pdf` 這個 plugin id 算出來固定是 `pdf-c35b21d6ca39`，所以這個路徑不會因為升級版本而改變，設定一次就好。
+- 不確定實際路徑時可以直接列出來：
+  ```sh
+  ls -d ~/.config/herdr/plugins/github/pdf-*/bin/herdr-pdf
+  ```
+- 設定好之後按 `O`：選到 `.pdf` 會在 file-viewer 右側開這個 plugin 的閱讀窗格；選到其他檔案（含目錄）則照舊交給系統 opener 開啟。
 
 ## 快捷鍵
 
@@ -252,7 +269,7 @@ herdr plugin enable pdf   # if it doesn't come up enabled
 
 `[[build]]` runs `./build.sh`, which downloads a version- and platform-matched, SHA-256-verified prebuilt binary from the GitHub release first, and only falls back to a local `go build` on a miss (no network, no matching release, checksum failure). For plugin development, use `herdr plugin link /path/to/herdr-pdf` instead so rebuilds pick up local source changes.
 
-Pin a version with `--ref v0.3.0`; to upgrade, just re-run `herdr plugin install tim80411/herdr-pdf` (herdr has no separate update subcommand). If this machine previously had the plugin linked, run `herdr plugin unlink pdf` first.
+Pin a version with `--ref v0.3.1`; to upgrade, just re-run `herdr plugin install tim80411/herdr-pdf` (herdr has no separate update subcommand). If this machine previously had the plugin linked, run `herdr plugin unlink pdf` first.
 
 ### Usage
 
@@ -261,6 +278,7 @@ Pin a version with `--ref v0.3.0`; to upgrade, just re-run `herdr plugin install
 - Or invoke the action through herdr's CLI: `herdr plugin action invoke open --plugin pdf` — note the action id is `open` with a separate `--plugin pdf` flag, not a combined `pdf.open`. This form has no CLI slot for a file path, so it depends on herdr's own click context to resolve one; prefer the two options above for everyday use.
 - Or bind a key in herdr's `config.toml` (`[[keys.command]]`, `type = "plugin_action"`, `command = "pdf.open"` — the combined `<plugin>.<action>` form, unlike the CLI's separate `open --plugin pdf`); it opens whatever `.pdf` path is currently selected in the pane, resolved against that pane's cwd. Run `herdr server reload-config` after editing.
 - With nothing selected, the pane opens in **browser mode** instead of failing: the same split pane, but showing a path bar and a directory listing rather than a document. A selection made in the outer terminal emulator never reaches herdr, so browser mode is the everyday path for the keybinding. A real error — a non-PDF, a remote `file://` host, a missing file — still reports itself rather than falling back.
+- Or wire it up as the opener for **herdr-file-viewer** (a separate herdr plugin): set its `open` config to `<abs path to>/bin/herdr-pdf open --fallback=system`, and its `O` key opens `.pdf` files here while handing everything else to the OS opener (`open` on macOS, `xdg-open` on Linux) instead of doing nothing. See the "接到 herdr-file-viewer" section above for the exact config path.
 
 ### Browser mode keys
 

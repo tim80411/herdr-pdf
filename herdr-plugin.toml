@@ -18,7 +18,7 @@
 
 id = "pdf"
 name = "PDF Viewer"
-version = "0.3.0"
+version = "0.3.1"
 description = "View PDF files as rendered pages in a herdr split pane."
 min_herdr_version = "0.9.0"
 platforms = ["macos", "linux"]
