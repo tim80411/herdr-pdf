@@ -2,6 +2,7 @@ package render
 
 import (
 	"bytes"
+	"errors"
 	"image/png"
 	"testing"
 )
@@ -80,5 +81,54 @@ func TestEncodeAdaptiveNeverFailsOnImpossibleBudget(t *testing.T) {
 	}
 	if _, derr := png.Decode(bytes.NewReader(enc.Payload)); derr != nil {
 		t.Fatalf("impossible budget produced undecodable PNG: %v", derr)
+	}
+}
+
+func TestEncodeAdaptiveLimitedShrinksPastTheLadderToFit(t *testing.T) {
+	frame := textPage(400, 560)
+
+	full, err := EncodeAdaptive(frame, 0)
+	if err != nil {
+		t.Fatalf("unbudgeted encode: %v", err)
+	}
+	// No soft budget, so the ladder returns truecolour; the hard ceiling
+	// below it must still force something smaller out.
+	hardMax := len(full.Payload) / 4
+	enc, err := EncodeAdaptiveLimited(frame, 0, hardMax)
+	if err != nil {
+		t.Fatalf("EncodeAdaptiveLimited: %v", err)
+	}
+	if len(enc.Payload) > hardMax {
+		t.Errorf("returned %d bytes, over the %d hard limit", len(enc.Payload), hardMax)
+	}
+	img, derr := png.Decode(bytes.NewReader(enc.Payload))
+	if derr != nil {
+		t.Fatalf("undecodable PNG: %v", derr)
+	}
+	if got := img.Bounds(); got.Dx() != enc.Width || got.Dy() != enc.Height {
+		t.Errorf("reported %dx%d but PNG is %dx%d", enc.Width, enc.Height, got.Dx(), got.Dy())
+	}
+}
+
+func TestEncodeAdaptiveLimitedReportsAnUnreachableCeiling(t *testing.T) {
+	// EncodeAdaptive alone returns an over-budget payload here; the limited
+	// form must refuse instead of handing back bytes the stream would drop.
+	_, err := EncodeAdaptiveLimited(textPage(400, 560), 1, 1)
+	if !errors.Is(err, ErrTooLarge) {
+		t.Fatalf("err = %v, want ErrTooLarge", err)
+	}
+}
+
+func TestEncodeAdaptiveLimitedPassesThroughWhenItAlreadyFits(t *testing.T) {
+	frame := textPage(200, 280)
+	enc, err := EncodeAdaptiveLimited(frame, 0, 1<<24)
+	if err != nil {
+		t.Fatalf("EncodeAdaptiveLimited: %v", err)
+	}
+	if enc.Strategy != "rgb" {
+		t.Errorf("strategy = %q, want the ladder's untouched result", enc.Strategy)
+	}
+	if enc.Width != 200 || enc.Height != 280 {
+		t.Errorf("size = %dx%d, want 200x280", enc.Width, enc.Height)
 	}
 }

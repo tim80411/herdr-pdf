@@ -1,10 +1,9 @@
-// Package ui holds terminal plumbing for the viewer: raw mode / alt screen
-// lifecycle, key decoding, and status-line layout. None of it talks to
-// herdr's socket API — that split keeps this package testable without a
-// pty or a running herdr server.
+// Package ui holds terminal plumbing for the viewer (raw mode, alt screen,
+// key decoding, status-line layout) with no dependency on herdr's socket API.
 package ui
 
 import (
+	"io"
 	"os"
 	"sync"
 
@@ -24,14 +23,23 @@ const (
 	resetSGR        = "\x1b[0m"
 )
 
+// Screen is the terminal surface the viewer draws on. Taking it as an
+// interface lets the shutdown path be driven without a tty.
+type Screen interface {
+	Enter() error
+	Restore()
+	WriteString(s string)
+	ClearScreen()
+}
+
 // Terminal owns the raw-mode / alternate-screen lifecycle for the process's
-// own stdin/stdout. Every restoration step in Restore runs independently of
-// the others (ARCH-review P1: viewer.py's single unguarded `finally` block
-// could skip cursor/autowrap/alt-screen restoration entirely if tcsetattr
-// raised first), and Restore is idempotent so it is safe to call from both
-// a normal deferred cleanup and, e.g., a last-resort signal handler.
+// own stdin/stdout. Restore is idempotent and each of its steps runs
+// independently, so it's safe to call from both a deferred cleanup and a
+// last-resort signal handler.
 type Terminal struct {
 	fd       int
+	out      io.Writer
+	raw      bool
 	oldState *term.State
 	entered  bool
 	mu       sync.Mutex
@@ -39,31 +47,40 @@ type Terminal struct {
 
 // New creates a Terminal bound to the process's stdin file descriptor.
 func New() *Terminal {
-	return &Terminal{fd: int(os.Stdin.Fd())}
+	return &Terminal{fd: int(os.Stdin.Fd()), out: os.Stdout, raw: true}
 }
 
-// Enter switches into the alternate screen, hides the cursor, disables
-// autowrap, and puts stdin into raw mode (equivalent to Python's
-// tty.setraw). Disabling autowrap is belt-and-suspenders against a status
-// line that's one column too wide (from a width-calculation edge case)
-// triggering a scroll that would push the status line up under the image
-// layer — the same reasoning viewer.py used for DISABLE_AUTOWRAP.
+// NewForOutput creates a Terminal that writes its control sequences to w and
+// leaves termios untouched.
+func NewForOutput(w io.Writer) *Terminal {
+	return &Terminal{out: w}
+}
+
+// Enter puts stdin into raw mode, then switches into the alternate screen,
+// hides the cursor, and disables autowrap. Raw mode goes first because it is
+// the step that can fail; a failure afterwards rolls the whole thing back so
+// the caller never has to clean up a half-entered terminal. Disabling
+// autowrap guards against a one-column status-line overflow scrolling the
+// pane and pushing the status line up under the image layer.
 func (t *Terminal) Enter() error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	os.Stdout.WriteString(enterAltScreen + hideCursor + disableAutowrap)
-	state, err := term.MakeRaw(t.fd)
-	if err != nil {
+	if t.raw {
+		state, err := term.MakeRaw(t.fd)
+		if err != nil {
+			return err
+		}
+		t.oldState = state
+	}
+	if _, err := io.WriteString(t.out, enterAltScreen+hideCursor+disableAutowrap); err != nil {
+		t.undo()
 		return err
 	}
-	t.oldState = state
 	t.entered = true
 	return nil
 }
 
-// Restore undoes Enter. Each step is attempted independently so a failure
-// restoring termios attributes (e.g. stdin already closed) doesn't skip
-// re-enabling autowrap, showing the cursor, or leaving the alt screen.
+// Restore undoes Enter.
 func (t *Terminal) Restore() {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -71,31 +88,38 @@ func (t *Terminal) Restore() {
 		return
 	}
 	t.entered = false
-	func() {
-		defer func() { recover() }()
-		if t.oldState != nil {
-			_ = term.Restore(t.fd, t.oldState)
-		}
-	}()
-	func() {
-		defer func() { recover() }()
-		os.Stdout.WriteString(enableAutowrap)
-	}()
-	func() {
-		defer func() { recover() }()
-		os.Stdout.WriteString(showCursor)
-	}()
-	func() {
-		defer func() { recover() }()
-		os.Stdout.WriteString(leaveAltScreen)
-	}()
+	t.undo()
+}
+
+// undo attempts each teardown step independently so one failure (e.g. stdin
+// already closed) doesn't skip the rest. Callers hold mu.
+func (t *Terminal) undo() {
+	if t.oldState != nil {
+		state := t.oldState
+		t.oldState = nil
+		func() {
+			defer func() { recover() }()
+			_ = term.Restore(t.fd, state)
+		}()
+	}
+	for _, seq := range []string{enableAutowrap, showCursor, leaveAltScreen} {
+		func() {
+			defer func() { recover() }()
+			_, _ = io.WriteString(t.out, seq)
+		}()
+	}
+}
+
+// WriteString sends raw output to the screen.
+func (t *Terminal) WriteString(s string) {
+	_, _ = io.WriteString(t.out, s)
 }
 
 // ClearScreen clears the alternate screen's text content and homes the
 // cursor. It does not touch any graphics layer — those are a separate
-// compositing plane in herdr (ARCH-review "process／PTY／socket 三層關係").
-func ClearScreen() {
-	os.Stdout.WriteString(clearScreenSeq)
+// compositing plane in herdr.
+func (t *Terminal) ClearScreen() {
+	t.WriteString(clearScreenSeq)
 }
 
 // Size reports this process's controlling terminal size in cells via

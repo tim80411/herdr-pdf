@@ -3,6 +3,7 @@ package ui
 import (
 	"bufio"
 	"bytes"
+	"strings"
 	"testing"
 )
 
@@ -39,9 +40,8 @@ func TestReadKeyArrows(t *testing.T) {
 }
 
 func TestReadKeyPageUpDown(t *testing.T) {
-	// \x1b[5~ (PageUp) and \x1b[6~ (PageDown) are 4 bytes — the case
-	// viewer.py's fixed-3-byte read_key() mishandled (ARCH-review P2),
-	// leaving the trailing '~' to be misread as the next keypress.
+	// \x1b[5~ (PageUp) and \x1b[6~ (PageDown) are 4-byte sequences, testing
+	// that ReadKey consumes through the final byte instead of a fixed length.
 	readAll(t, []byte("\x1b[5~\x1b[6~"), []KeyEvent{
 		{Key: KeyPageUp},
 		{Key: KeyPageDown},
@@ -124,5 +124,41 @@ func TestStartKeyReaderClosesOnEOF(t *testing.T) {
 	}
 	if _, ok := <-ch; ok {
 		t.Fatal("channel should be closed after KeyEOF")
+	}
+}
+
+func TestReadKeyDiscardsOverlongCSIThroughItsFinalByte(t *testing.T) {
+	// A sequence with more parameter bytes than the decoder buffers must be
+	// swallowed whole: leaving its tail behind would turn the remainder into
+	// spurious keypresses.
+	input := "\x1b[" + strings.Repeat("1;", 20) + "~q"
+	r := bufio.NewReader(strings.NewReader(input))
+
+	ev, err := ReadKey(r)
+	if err != nil {
+		t.Fatalf("ReadKey: %v", err)
+	}
+	if ev.Key != KeyUnknown {
+		t.Errorf("over-long CSI decoded as %v, want KeyUnknown", ev.Key)
+	}
+
+	ev, err = ReadKey(r)
+	if err != nil {
+		t.Fatalf("ReadKey after discard: %v", err)
+	}
+	if ev.Key != KeyRune || ev.Rune != 'q' {
+		t.Errorf("next key = %v/%q, want the 'q' that followed the sequence", ev.Key, ev.Rune)
+	}
+}
+
+func TestReadKeyOverlongCSIWithoutFinalByteStops(t *testing.T) {
+	// No final byte ever arrives; the decoder must give up rather than loop.
+	r := bufio.NewReader(strings.NewReader("\x1b[" + strings.Repeat("1;", 40)))
+	ev, err := ReadKey(r)
+	if err != nil {
+		t.Fatalf("ReadKey: %v", err)
+	}
+	if ev.Key != KeyEOF && ev.Key != KeyUnknown {
+		t.Errorf("got %v, want KeyEOF or KeyUnknown", ev.Key)
 	}
 }

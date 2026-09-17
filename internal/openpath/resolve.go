@@ -1,7 +1,6 @@
 // Package openpath resolves which PDF file the "open" action/link-handler
-// should open, porting resolve_path.py's priority order and semantics
-// exactly (including its one deliberately narrow quirk: a bare, non-
-// file:// candidate is percent-decoded only when it starts with "%").
+// should open, in priority order: argv, then clicked-URL env, then context
+// JSON's clicked_url/selected_text.
 package openpath
 
 import (
@@ -13,49 +12,43 @@ import (
 )
 
 // Context mirrors the fields this package reads out of
-// $HERDR_PLUGIN_CONTEXT_JSON. herdr documents more fields than this; only
-// the ones resolve_path.py used are decoded here.
+// $HERDR_PLUGIN_CONTEXT_JSON; herdr documents more fields than this, but
+// only these are decoded.
 type Context struct {
 	ClickedURL     string `json:"clicked_url"`
 	SelectedText   string `json:"selected_text"`
 	FocusedPaneCwd string `json:"focused_pane_cwd"`
 }
 
-// stripFileURL strips a file:// prefix and percent-decodes the result, or
-// percent-decodes a bare candidate that itself starts with "%". Ports
-// resolve_path.py's strip_file_url() verbatim, quirk included: a %-escape
-// in the *middle* of a bare (non-file://) path is deliberately left alone.
-func stripFileURL(candidate string) string {
-	if strings.HasPrefix(candidate, "file://") {
-		u, err := url.Parse(candidate)
-		if err != nil {
-			return candidate
-		}
-		if dec, derr := url.PathUnescape(u.Path); derr == nil {
-			return dec
-		}
-		return u.Path
+// stripFileURL turns a file:// URL into a filesystem path. Percent-decoding
+// applies only here: a bare path is taken literally, so a filename that
+// really contains "%20" still opens.
+func stripFileURL(candidate string) (string, error) {
+	if !strings.HasPrefix(candidate, "file://") {
+		return candidate, nil
 	}
-	if strings.HasPrefix(candidate, "%") {
-		if dec, err := url.PathUnescape(candidate); err == nil {
-			return dec
-		}
+	u, err := url.Parse(candidate)
+	if err != nil {
+		return "", fmt.Errorf("invalid file URL %q: %w", candidate, err)
 	}
-	return candidate
+	// A host other than localhost names a file on another machine, which
+	// this process cannot open.
+	if u.Host != "" && !strings.EqualFold(u.Host, "localhost") {
+		return "", fmt.Errorf("file URL names remote host %q, which cannot be opened locally", u.Host)
+	}
+	dec, derr := url.PathUnescape(u.Path)
+	if derr != nil {
+		return u.Path, nil
+	}
+	return dec, nil
 }
 
 // Resolve picks the PDF path to open, in priority order: argvPath,
 // clickedURLEnv ($HERDR_PLUGIN_CLICKED_URL), then the context JSON's
 // clicked_url, then its selected_text. A relative result is joined against
-// the context's focused_pane_cwd, falling back to cwd, and made absolute.
-//
-// contextJSON is the raw value of $HERDR_PLUGIN_CONTEXT_JSON; malformed or
-// empty JSON is treated as "no context" (matching resolve_path.py's
-// try/except that swallows JSONDecodeError/ValueError), not an error.
-//
-// This function only computes a path — it does not check the file exists;
-// callers do that themselves (matching resolve_path.py's docstring, which
-// says the same of open.sh's separate `-f` check).
+// the context's focused_pane_cwd (falling back to cwd) and made absolute.
+// Malformed or empty contextJSON is treated as "no context", not an error.
+// This function only computes a path; it does not check the file exists.
 func Resolve(argvPath, clickedURLEnv, contextJSON, cwd string) (string, error) {
 	candidate := argvPath
 	if candidate == "" {
@@ -77,9 +70,19 @@ func Resolve(argvPath, clickedURLEnv, contextJSON, cwd string) (string, error) {
 		return "", fmt.Errorf("no candidate path found (no arg, no clicked_url, no selected_text)")
 	}
 
-	candidate = stripFileURL(strings.TrimSpace(candidate))
+	// Only the trailing newline a shell or clipboard adds is stripped;
+	// spaces are legal at either end of a filename.
+	candidate = strings.TrimRight(candidate, "\r\n")
+
+	candidate, err := stripFileURL(candidate)
+	if err != nil {
+		return "", err
+	}
 	if candidate == "" {
 		return "", fmt.Errorf("candidate resolved to empty string")
+	}
+	if strings.ContainsRune(candidate, 0) {
+		return "", fmt.Errorf("非法路徑（含 NUL 位元組）: %q", candidate)
 	}
 
 	if !filepath.IsAbs(candidate) {

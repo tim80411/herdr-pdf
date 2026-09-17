@@ -9,14 +9,9 @@ import (
 
 // DisplayWidth returns the terminal column width of s: 2 per East Asian
 // Wide/Fullwidth rune (CJK, full-width punctuation, ...), 0 for
-// zero-width/combining runes, 1 otherwise. This mirrors viewer.py's
-// hand-rolled display_width(), which existed because Python's len()
-// undercounts CJK filenames by half — enough to overflow the status line
-// past the pane width and trigger an autowrap-induced scroll that pushed
-// the status line up under the image layer (viewer.py:148-162).
-// go-runewidth implements the same East Asian Width Unicode annex the
-// Python version was hand-coding, and is what herdr's own Rust terminal
-// emulator (libghostty-vt) is measuring against on the other end.
+// zero-width/combining runes, 1 otherwise. Undercounting a CJK filename
+// would overflow the status line and trigger an autowrap scroll that
+// pushes it up under the image layer.
 func DisplayWidth(s string) int {
 	return runewidth.StringWidth(s)
 }
@@ -48,15 +43,11 @@ func TruncateToWidth(s string, maxWidth int) string {
 	return b.String() + "…"
 }
 
-// StatusLine lays out the bottom row's content (without the escape
-// sequences to actually paint it — see RenderStatusLine): name (left,
-// truncated to fit), mid (center — page indicator + key hints), right
-// (render/stream diagnostics), padded to exactly cols-1 display columns.
-//
-// It never fills the last column: on a CJK-heavy filename, overflowing the
-// last column would trip the terminal's autowrap and scroll the pane,
-// which is the same status-line-overflow bug DISABLE_AUTOWRAP in
-// Terminal.Enter is a second line of defense against.
+// StatusLine lays out the bottom row's content (without paint escapes — see
+// RenderStatusLine): name (left, truncated to fit), mid (center — page
+// indicator + key hints), right (render/stream diagnostics), padded to
+// exactly cols-1 display columns. It never fills the last column, since
+// doing so on a CJK-heavy name would trip the terminal's autowrap and scroll the pane.
 func StatusLine(name, mid, right string, cols int) string {
 	avail := cols - 1
 	if avail < 0 {

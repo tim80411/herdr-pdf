@@ -9,7 +9,7 @@ func TestDisplayWidthCJK(t *testing.T) {
 		want int
 	}{
 		{"ascii", "report.pdf", 10},
-		{"cjk filename", "簡章(中文版).pdf", 16}, // ARCH-review: len()==11, display width==16
+		{"cjk filename", "簡章(中文版).pdf", 16}, // rune count is 11, display width is 16
 		{"empty", "", 0},
 		{"mixed cjk ascii", "報告.pdf", 8}, // 報告=4 + ".pdf"=4
 	}
@@ -36,7 +36,7 @@ func TestTruncateToWidth(t *testing.T) {
 		{"negative width", "abc", -1, ""},
 		{"width one always ellipsis", "abcdef", 1, "…"},
 		{"cjk truncation respects column budget", "簡章(中文版).pdf", 5, "簡章…"}, // budget=4 after reserving ellipsis: 簡(2)+章(2)=4 fits, "(" (1) would push to 5
-		{"never exceeds width for empty budget case", "x", 1, "x"},           // exact fit, no truncation needed
+		{"never exceeds width for empty budget case", "x", 1, "x"},         // exact fit, no truncation needed
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

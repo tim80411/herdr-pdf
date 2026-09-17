@@ -23,8 +23,9 @@ description = "View PDF files as rendered pages in a herdr split pane."
 min_herdr_version = "0.9.0"
 platforms = ["macos", "linux"]
 
-# Compiles the Go sources into bin/herdr-pdf. Idempotent (a plain `go
-# build` overwrite); runs once at link/install time and again on update.
+# Installs bin/herdr-pdf: downloads a version-matched, SHA-256-verified
+# prebuilt binary when one is available, otherwise builds from source with
+# Go. Idempotent; runs once at link/install time and again on update.
 [[build]]
 command = ["./build.sh"]
 
@@ -38,7 +39,7 @@ placement = "split"
 command = ["./bin/herdr-pdf", "view"]
 
 # Entry point for both link-click handling and manual invocation
-# (`herdr plugin action invoke pdf.open -- /path/to/file.pdf`).
+# (`herdr plugin action invoke open --plugin pdf`).
 [[actions]]
 id = "open"
 title = "Open PDF"

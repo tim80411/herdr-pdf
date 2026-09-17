@@ -1,0 +1,94 @@
+# Cross-compiles herdr-pdf for the platforms build.sh's fetch-or-build step
+# expects, then publishes them (plus a checksums.txt) to the GitHub Release
+# for the pushed tag. Runs entirely on ubuntu-latest — CGO_ENABLED=0 and the
+# Go toolchain's built-in cross-compiler mean no per-OS runner is needed.
+# Asset names must match what build.sh constructs:
+# herdr-pdf_<version>_<os>_<arch>[.exe], version = tag with the leading "v"
+# stripped; the same version is linked into the binary via -X main.version.
+# Uses only first-party GitHub actions plus the preinstalled `gh` CLI, no
+# third-party marketplace actions.
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      matrix:
+        include:
+          - os: darwin
+            arch: amd64
+          - os: darwin
+            arch: arm64
+          - os: linux
+            arch: amd64
+          - os: linux
+            arch: arm64
+          - os: windows
+            arch: amd64
+          - os: windows
+            arch: arm64
+    env:
+      CGO_ENABLED: "0"
+      GOOS: ${{ matrix.os }}
+      GOARCH: ${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Resolve build metadata
+        id: asset
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          ext=""
+          if [ "${{ matrix.os }}" = "windows" ]; then ext=".exe"; fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "name=herdr-pdf_${version}_${{ matrix.os }}_${{ matrix.arch }}${ext}" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        run: |
+          mkdir -p dist
+          go build -trimpath -ldflags="-s -w -X main.version=${{ steps.asset.outputs.version }}" -o "dist/${{ steps.asset.outputs.name }}" ./cmd/herdr-pdf
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.asset.outputs.name }}
+          path: dist/${{ steps.asset.outputs.name }}
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum -- * > checksums.txt
+
+      - name: Publish release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes

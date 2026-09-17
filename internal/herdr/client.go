@@ -1,12 +1,8 @@
 // Package herdr implements the client side of herdr's socket API:
 // newline-delimited JSON over a Unix domain socket at $HERDR_SOCKET_PATH.
-//
-// The protocol has a hard constraint that shapes this whole package: the
-// server handles exactly one request per connection (herdr src/api/server.rs:169
-// calls read_initial_request_line once, with no loop after it) and then
-// closes. So Call always dials fresh. The one exception is
-// pane.graphics.stream, which hands the connection off to a different
-// handler entirely (see stream.go) — that's why it isn't just another Call.
+// The server handles exactly one request per connection then closes, so
+// Call always dials fresh; pane.graphics.stream is the one exception (see
+// stream.go), which hands the connection off to a different handler entirely.
 package herdr
 
 import (
@@ -17,8 +13,32 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
+
+// maxResponseBytes bounds one response line. herdr's replies are small
+// status objects, so anything larger is a protocol fault, not a big result.
+const maxResponseBytes = 1 << 20
+
+// readLine reads one newline-terminated line without the terminator,
+// refusing to buffer past maxResponseBytes.
+func readLine(br *bufio.Reader) (string, error) {
+	var sb strings.Builder
+	for {
+		chunk, more, err := br.ReadLine()
+		sb.Write(chunk)
+		if sb.Len() > maxResponseBytes {
+			return "", fmt.Errorf("response line exceeds %d bytes", maxResponseBytes)
+		}
+		if err != nil {
+			return sb.String(), err
+		}
+		if !more {
+			return sb.String(), nil
+		}
+	}
+}
 
 // SocketPath returns $HERDR_SOCKET_PATH, or the documented default if unset.
 func SocketPath() string {
@@ -30,10 +50,7 @@ func SocketPath() string {
 }
 
 // Error represents herdr's top-level {"error":{"code","message"}} response
-// shape. It is never nested inside "result" — G1/ARCH-review both confirm
-// the Python viewer's dead code path that checked result.code was wrong;
-// herdr always reports errors at the top level
-// (api/schema/response.rs, app/api/responses.rs).
+// shape; it is never nested inside "result".
 type Error struct {
 	Code    string `json:"code"`
 	Message string `json:"message"`
@@ -78,7 +95,7 @@ func Call(method string, params interface{}, result interface{}) error {
 
 	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 	br := bufio.NewReaderSize(conn, 64*1024)
-	respLine, err := br.ReadString('\n')
+	respLine, err := readLine(br)
 	if err != nil && respLine == "" {
 		return fmt.Errorf("read response: %w", err)
 	}
@@ -108,10 +125,10 @@ type GraphicsInfo struct {
 	MaxLayersPerPane   int    `json:"max_layers_per_pane"`
 }
 
-// PaneGraphicsInfo fetches cell pixel geometry for paneID. Must be called
-// fresh before every render — cell size is not stable across clients or
-// even across calls to the same pane (observed 8x19 vs 15x38 px, ARCH-review
-// "邊界案例矩陣"), so callers must never cache the result.
+// PaneGraphicsInfo fetches cell pixel geometry for paneID. Cell size is not
+// stable across clients or even across calls to the same pane, so this
+// function never caches — callers that want caching (see the viewer
+// package) must add their own TTL on top.
 func PaneGraphicsInfo(paneID string) (*GraphicsInfo, error) {
 	var info GraphicsInfo
 	if err := Call("pane.graphics.info", map[string]string{"pane_id": paneID}, &info); err != nil {

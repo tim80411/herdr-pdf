@@ -1,6 +1,6 @@
 module github.com/tim80411/herdr-pdf
 
-go 1.26.5
+go 1.26.0
 
 require (
 	github.com/klippa-app/go-pdfium v1.19.8

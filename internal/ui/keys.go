@@ -22,11 +22,8 @@ const (
 	KeyPageDown
 	KeyUnknown
 	// KeyEOF is reported when the underlying reader hits EOF (e.g. the pty
-	// master closed). The caller's main loop must treat this as "stop", not
-	// "no key available right now" — viewer.py's read_key() conflated the
-	// two by returning "" for both timeout and EOF, which spun the main
-	// loop at up to ~570k iterations/0.5s against a closed fd
-	// (ARCH-review P0, reproduced in scratchpad/eoftest.py).
+	// master closed). The caller must treat this as "stop", not "no key
+	// available right now".
 	KeyEOF
 )
 
@@ -37,16 +34,11 @@ type KeyEvent struct {
 	Rune rune
 }
 
-// ReadKey reads one logical key press from r: either a single byte (ASCII
-// keys only matter for this viewer's bindings, so raw bytes are returned
-// as-is rather than fully UTF-8 decoded) or a CSI escape sequence
-// (ESC '[' ... final-byte).
-//
-// It always reads through to a CSI final byte (0x40-0x7E) before
-// returning, which is the fix for viewer.py's read_key(): that function
-// read a fixed 3 bytes for any escape sequence, so a 4-byte sequence like
-// PageUp's \x1b[5~ left the trailing '~' in the input buffer to be
-// misparsed as the *next* keypress (ARCH-review P2, viewer.py:409-424).
+// ReadKey reads one logical key press from r: either a single raw byte
+// (only ASCII bindings matter here, so no UTF-8 decoding) or a CSI escape
+// sequence (ESC '[' ... final-byte). It always reads through to the CSI
+// final byte (0x40-0x7E) before returning, so a multi-byte sequence like
+// PageUp's \x1b[5~ can't leave a trailing byte to be misparsed as the next keypress.
 func ReadKey(r *bufio.Reader) (KeyEvent, error) {
 	b, err := r.ReadByte()
 	if err != nil {
@@ -91,11 +83,28 @@ func ReadKey(r *bufio.Reader) (KeyEvent, error) {
 		}
 		params = append(params, c)
 		if len(params) > 16 {
-			// Runaway sequence (shouldn't happen for real terminals) —
-			// give up and report unknown rather than reading forever.
-			return KeyEvent{Key: KeyUnknown}, nil
+			return discardCSI(r), nil
 		}
 	}
+}
+
+// discardCSI drops an over-long control sequence, reading on to its final
+// byte (0x40-0x7E) first so the tail cannot be misread as the next keypress.
+// The byte budget bounds the damage from a stream that never sends one.
+func discardCSI(r *bufio.Reader) KeyEvent {
+	for i := 0; i < 256; i++ {
+		c, err := r.ReadByte()
+		if err != nil {
+			if err == io.EOF {
+				return KeyEvent{Key: KeyEOF}
+			}
+			return KeyEvent{Key: KeyUnknown}
+		}
+		if c >= 0x40 && c <= 0x7e {
+			break
+		}
+	}
+	return KeyEvent{Key: KeyUnknown}
 }
 
 func decodeCSI(final byte, params []byte) KeyEvent {
@@ -129,9 +138,8 @@ func decodeCSI(final byte, params []byte) KeyEvent {
 
 // StartKeyReader runs ReadKey in a loop on a background goroutine and
 // publishes decoded events to the returned channel, closing it after a
-// KeyEOF or a read error. This lets the main loop use select to multiplex
-// key events against resize signals and debounce timers instead of the
-// polling-with-timeout style viewer.py needed without goroutines.
+// KeyEOF or a read error. This lets the main loop select over key events,
+// resize signals, and debounce timers.
 func StartKeyReader(r *bufio.Reader) <-chan KeyEvent {
 	ch := make(chan KeyEvent, 32)
 	go func() {

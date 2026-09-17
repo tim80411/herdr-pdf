@@ -1,19 +1,20 @@
 // Package render rasterizes PDF pages to tightly-packed RGBA using
-// go-pdfium's WebAssembly (wazero) backend — no system Poppler/MuPDF
-// dependency, matching the license and distribution rationale that picked
-// pypdfium2 for the Python version (ARCH-review "設計決策評估").
+// go-pdfium's WebAssembly (wazero) backend — no system Poppler/MuPDF dependency.
 package render
 
 import (
+	"errors"
 	"fmt"
 	"image"
 	"image/draw"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
 	pdfiumtop "github.com/klippa-app/go-pdfium"
+	pdfiumerr "github.com/klippa-app/go-pdfium/errors"
 	"github.com/klippa-app/go-pdfium/references"
 	"github.com/klippa-app/go-pdfium/requests"
 	"github.com/klippa-app/go-pdfium/webassembly"
@@ -35,12 +36,9 @@ type cacheKey struct {
 }
 
 // Renderer owns one pdfium WebAssembly instance and one open document.
-//
-// pdfium itself is single-threaded here (one wazero instance, MaxTotal 1),
-// so every call into inst is serialised by renderMu. That lock is what makes
-// Prefetch safe: the viewer can warm the next page on a background goroutine
-// while the main loop stays free to accept keys, and the two simply queue
-// behind each other inside pdfium instead of corrupting it.
+// pdfium is single-threaded here (one wazero instance, MaxTotal 1), so every
+// call is serialised by renderMu — this is what makes it safe for a
+// background prefetch goroutine to run alongside the main loop.
 type Renderer struct {
 	pool pdfiumtop.Pool
 	inst pdfiumtop.Pdfium
@@ -60,13 +58,17 @@ type Renderer struct {
 	cacheKeys []cacheKey
 	cache     map[cacheKey]*Frame
 	cacheCap  int
+
+	// inflight lets a second request for a key wait on the render already
+	// running for it instead of rasterising the same page twice. Guarded by
+	// cacheMu so the cache lookup and the claim are one atomic decision.
+	inflight map[cacheKey]chan struct{}
 }
 
-// WazeroCacheDir returns where to persist wazero's compiled-module cache,
-// so pdfium's cold compile (~1.3s per G1-report) only ever happens once per
-// machine rather than once per pane launch. $HERDR_PLUGIN_STATE_DIR/wazero
-// is preferred (it's the plugin's own per-install state directory);
-// ~/.cache/herdr-pdf/wazero is the fallback for running outside herdr.
+// WazeroCacheDir returns where to persist wazero's compiled-module cache, so
+// pdfium's cold compile happens once per machine rather than once per pane
+// launch. Prefers $HERDR_PLUGIN_STATE_DIR/wazero, falling back to
+// ~/.cache/herdr-pdf/wazero outside herdr.
 func WazeroCacheDir() string {
 	if d := os.Getenv("HERDR_PLUGIN_STATE_DIR"); d != "" {
 		return filepath.Join(d, "wazero")
@@ -75,10 +77,9 @@ func WazeroCacheDir() string {
 	return filepath.Join(home, ".cache", "herdr-pdf", "wazero")
 }
 
-// NewRenderer starts the pdfium WebAssembly runtime using (and warming, if
-// this is the first run) the compilation cache at cacheDir. This is the
-// expensive step and should run before the terminal enters raw mode, so a
-// cold 1.3s compile doesn't look like a silent hang with no cursor.
+// NewRenderer starts the pdfium WebAssembly runtime, warming the compile
+// cache at cacheDir on first run. Run this before the terminal enters raw
+// mode, so a cold compile doesn't look like a silent hang with no cursor.
 func NewRenderer(cacheDir string) (*Renderer, error) {
 	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
 		return nil, fmt.Errorf("create wazero cache dir %s: %w", cacheDir, err)
@@ -109,6 +110,35 @@ func NewRenderer(cacheDir string) (*Renderer, error) {
 	}, nil
 }
 
+// Open failure classes worth telling the reader apart.
+var (
+	// ErrEncrypted reports a document that needs a password to open.
+	ErrEncrypted = errors.New("pdf is password protected")
+	// ErrCorrupt reports bytes pdfium cannot parse as a PDF.
+	ErrCorrupt = errors.New("pdf is corrupt or not a pdf")
+)
+
+// classifyOpenError tags pdfium's open failures, keeping the library's own
+// message for the log. Sentinels are matched first; the message text is a
+// fallback for a backend that reports the failure some other way.
+func classifyOpenError(err error) error {
+	switch {
+	case errors.Is(err, pdfiumerr.ErrPassword), errors.Is(err, pdfiumerr.ErrSecurity):
+		return fmt.Errorf("%w: %v", ErrEncrypted, err)
+	case errors.Is(err, pdfiumerr.ErrFormat):
+		return fmt.Errorf("%w: %v", ErrCorrupt, err)
+	}
+
+	msg := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(msg, "password"), strings.Contains(msg, "invalid encryption"):
+		return fmt.Errorf("%w: %v", ErrEncrypted, err)
+	case strings.Contains(msg, "incorrect format"), strings.Contains(msg, "format error"):
+		return fmt.Errorf("%w: %v", ErrCorrupt, err)
+	}
+	return err
+}
+
 // Open loads a PDF file. Call once per Renderer, before RenderPage.
 func (r *Renderer) Open(path string) error {
 	data, err := os.ReadFile(path)
@@ -118,7 +148,7 @@ func (r *Renderer) Open(path string) error {
 	r.pdfBytes = data
 	doc, err := r.inst.OpenDocument(&requests.OpenDocument{File: &r.pdfBytes})
 	if err != nil {
-		return fmt.Errorf("open document: %w", err)
+		return classifyOpenError(err)
 	}
 	r.doc = &doc.Document
 
@@ -137,17 +167,9 @@ func (r *Renderer) Open(path string) error {
 func (r *Renderer) PageCount() int { return r.pageCount }
 
 // RenderPage renders page index (0-based), fit within a maxW x maxH pixel
-// bounding box. go-pdfium's RenderPageInPixels treats width/height as a
-// maximum and preserves aspect ratio internally, so the caller does not
-// need to precompute a fit — unlike the Python version, which had to do
-// that arithmetic itself against pypdfium2's fixed-scale render() call.
-//
-// Results are cached by (page, maxW, maxH): a resize naturally produces a
-// new cache key rather than needing explicit invalidation, and revisiting a
-// page at an unchanged canvas size (the common case: paging back and forth
-// without resizing) is free. Cap is small (5) because a PDF viewer only
-// ever needs the current page plus its immediate neighbors in flight
-// (ARCH-review P1 "沒有頁面快取" — this is that fix, sized generously).
+// bounding box; RenderPageInPixels treats width/height as a maximum and
+// preserves aspect ratio internally. Results are cached by (page, maxW,
+// maxH), so paging back and forth at an unchanged canvas size is free.
 func (r *Renderer) RenderPage(index, maxW, maxH int) (*Frame, error) {
 	if index < 0 || index >= r.pageCount {
 		return nil, fmt.Errorf("page %d out of range [0,%d)", index, r.pageCount)
@@ -157,34 +179,68 @@ func (r *Renderer) RenderPage(index, maxW, maxH int) (*Frame, error) {
 	}
 	key := cacheKey{page: index, w: maxW, h: maxH}
 
-	r.cacheMu.Lock()
-	if f, ok := r.cache[key]; ok {
-		r.cacheMu.Unlock()
-		return f, nil
-	}
-	r.cacheMu.Unlock()
-
-	r.renderMu.Lock()
-	if r.closed {
+	return r.renderOnce(key, func() (*Frame, error) {
+		r.renderMu.Lock()
+		if r.closed {
+			r.renderMu.Unlock()
+			return nil, fmt.Errorf("renderer is closed")
+		}
+		page := requests.Page{ByIndex: &requests.PageByIndex{Document: *r.doc, Index: index}}
+		resp, err := r.inst.RenderPageInPixels(&requests.RenderPageInPixels{
+			Page: page, Width: maxW, Height: maxH,
+		})
 		r.renderMu.Unlock()
-		return nil, fmt.Errorf("renderer is closed")
-	}
-	page := requests.Page{ByIndex: &requests.PageByIndex{Document: *r.doc, Index: index}}
-	resp, err := r.inst.RenderPageInPixels(&requests.RenderPageInPixels{
-		Page: page, Width: maxW, Height: maxH,
+		if err != nil {
+			return nil, fmt.Errorf("render page %d: %w", index, err)
+		}
+		w, h, pix := TightRGBA(resp.Result.RenderedImage)
+		// WebAssembly mode: the pixel buffer is only valid until Cleanup() is
+		// called. TightRGBA has already copied it out, so it's safe to release now.
+		resp.Cleanup()
+		return &Frame{Width: w, Height: h, RGBA: pix}, nil
 	})
-	r.renderMu.Unlock()
-	if err != nil {
-		return nil, fmt.Errorf("render page %d: %w", index, err)
+}
+
+// renderOnce serves key from the cache, or runs render for it while any
+// other caller for the same key waits and then re-reads the cache. A failed
+// render leaves nothing cached, so the next caller retries it.
+func (r *Renderer) renderOnce(key cacheKey, render func() (*Frame, error)) (*Frame, error) {
+	for {
+		r.cacheMu.Lock()
+		if f, ok := r.cache[key]; ok {
+			r.cacheMu.Unlock()
+			return f, nil
+		}
+		if wait, ok := r.inflight[key]; ok {
+			r.cacheMu.Unlock()
+			<-wait
+			continue
+		}
+		if r.inflight == nil {
+			r.inflight = make(map[cacheKey]chan struct{})
+		}
+		done := make(chan struct{})
+		r.inflight[key] = done
+		r.cacheMu.Unlock()
+
+		frame, err := render()
+
+		r.cacheMu.Lock()
+		if err == nil {
+			r.storeLocked(key, frame)
+		}
+		delete(r.inflight, key)
+		r.cacheMu.Unlock()
+		close(done)
+		return frame, err
 	}
-	w, h, pix := TightRGBA(resp.Result.RenderedImage)
-	// WebAssembly mode: the pixel buffer is only valid until Cleanup() is
-	// called. TightRGBA has already copied it out, so it's safe to release now.
-	resp.Cleanup()
+}
 
-	frame := &Frame{Width: w, Height: h, RGBA: pix}
-
-	r.cacheMu.Lock()
+// storeLocked adds a frame and evicts the oldest past cacheCap. Callers hold cacheMu.
+func (r *Renderer) storeLocked(key cacheKey, frame *Frame) {
+	if r.cache == nil {
+		r.cache = make(map[cacheKey]*Frame)
+	}
 	r.cache[key] = frame
 	r.cacheKeys = append(r.cacheKeys, key)
 	for len(r.cacheKeys) > r.cacheCap {
@@ -192,16 +248,10 @@ func (r *Renderer) RenderPage(index, maxW, maxH int) (*Frame, error) {
 		r.cacheKeys = r.cacheKeys[1:]
 		delete(r.cache, oldest)
 	}
-	r.cacheMu.Unlock()
-
-	return frame, nil
 }
 
 // Cached reports whether a page is already rendered at this exact size, so
-// the caller can skip spawning a prefetch that would do nothing. RenderPage
-// itself is the prefetch entry point: it is already cache-backed and
-// mutex-guarded, so a background goroutine calling it warms the cache the
-// main loop will read.
+// the caller can skip spawning a prefetch that would do nothing.
 func (r *Renderer) Cached(index, maxW, maxH int) bool {
 	r.cacheMu.Lock()
 	defer r.cacheMu.Unlock()
@@ -229,10 +279,9 @@ func (r *Renderer) Close() error {
 }
 
 // TightRGBA copies any image into a densely packed w*h*4 straight-RGBA
-// buffer. Go's *image.RGBA does not guarantee Stride == 4*width (and
-// go-pdfium's WebAssembly backend often hands back one with row padding),
-// but herdr's stream frame protocol requires exactly width*height*4 bytes
-// with no padding (G1-report "RGBA stride 一定要自己收緊").
+// buffer. go-pdfium's WebAssembly backend often returns one with row
+// padding (Stride != 4*width), but herdr's frame protocol requires exactly
+// width*height*4 bytes with none.
 func TightRGBA(img image.Image) (width, height int, pix []byte) {
 	b := img.Bounds()
 	w, h := b.Dx(), b.Dy()

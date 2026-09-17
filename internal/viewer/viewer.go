@@ -1,12 +1,11 @@
-// Package viewer implements the herdr-pdf "view" pane's state machine:
-// open a PDF, take over the pane's terminal, and keep a rendered page
-// painted into the pane via herdr's graphics API while reacting to
-// keypresses and resizes.
+// Package viewer implements the herdr-pdf view pane's state machine.
 package viewer
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
+	"math"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -22,19 +21,21 @@ import (
 	"github.com/tim80411/herdr-pdf/internal/ui"
 )
 
-// namedLayerID is the graphics layer this viewer owns by default: "page",
-// not "primary", so a future feature (search-hit highlighting, an outline
-// overlay, ...) can use a second layer without fighting this one for the
-// same slot — herdr allows up to 16 layers per pane.
-//
-// primaryLayerID is the one exception. herdr's zero-copy file transport is
-// gated on the layer literally being "primary"
-// (app/api/pane_graphics.rs:312-315, PANE_GRAPHICS_PRIMARY_LAYER_ID =
-// "primary" at api/schema/panes.rs:11), so TransportDirect has to give up
-// the named-layer property to get the fast path.
+// primaryLayerID is required by TransportDirect: herdr's zero-copy file
+// transport only fires when the layer is literally "primary" (see herdr src
+// app/api/pane_graphics.rs:312).
 const (
 	namedLayerID   = "page"
 	primaryLayerID = "primary"
+)
+
+// Raster caps bound one page's pixel buffer. A terminal cell grid cannot
+// resolve more detail than this, while RGBA memory keeps growing with every
+// extra pixel: 2400x3200 is already ~31 MB per frame, held for several
+// frames by the render cache.
+const (
+	maxRasterW = 2400
+	maxRasterH = 3200
 )
 
 const (
@@ -43,44 +44,32 @@ const (
 	setShrinkPct = 0.85
 )
 
-// Transport selects how a rendered page reaches the terminal. The default
-// is TransportStreamPNG; the others exist as escape hatches via
-// $HERDR_PDF_TRANSPORT because each one is faster than the default under
-// some condition this viewer cannot detect from inside the pane.
+// Transport selects how a rendered page reaches the terminal, overridable
+// via $HERDR_PDF_TRANSPORT. TransportStreamPNG is the default.
 type Transport string
 
 const (
-	// TransportStreamPNG sends PNG bytes over the long-lived stream. This
-	// is the default because herdr never decodes PNG: it stores the
-	// compressed bytes as-is and hands Kitty format code 100 to the outer
-	// terminal (kitty_graphics.rs:688-694), so compressing the frame
-	// shrinks every stage downstream — the owned Vec copy, the
-	// whole-buffer hash, the uncompressed bincode wire message, the base64
-	// expansion, and the count of 3072-byte Kitty chunks
-	// (KITTY_CHUNK_BYTES at kitty_graphics.rs:20).
+	// TransportStreamPNG sends PNG bytes over the long-lived stream (default).
+	// herdr stores compressed bytes as-is with no re-encode, so a smaller
+	// payload here shrinks every downstream stage (hash, wire, base64, chunks).
 	TransportStreamPNG Transport = "stream-png"
 
-	// TransportStreamRGBA is the original behaviour: raw RGBA over the
-	// stream. No encode cost, but a fit-to-pane frame is ~11 MB, which
-	// base64-expands to ~14.7 MB of escape text in ~3,597 chunks on every
-	// single page flip (there is no zlib on this path).
+	// TransportStreamRGBA sends raw, uncompressed RGBA: no encode cost, but a
+	// fit-to-pane frame is ~11 MB (~14.7 MB after base64) sent on every flip.
 	TransportStreamRGBA Transport = "stream-rgba"
 
 	// TransportDirect writes RGBA to a file in pane.graphics.info's
-	// file_frame_directory and sends only its path, which lets herdr use
-	// Kitty's t=f file transport with no base64 at all. Requires
-	// file_frame_transport == "direct-kitty" and forces the layer to
-	// "primary"; falls back to TransportStreamPNG when unavailable.
+	// file_frame_directory and sends only the path (no base64). Requires
+	// file_frame_transport == "direct-kitty"; falls back to PNG otherwise.
 	TransportDirect Transport = "direct"
 
-	// TransportSet is the Python viewer's path: a short-lived
-	// pane.graphics.set call per page, PNG, capped at 512 KiB decoded.
+	// TransportSet issues a short-lived pane.graphics.set call per page
+	// (PNG, capped at 512 KiB decoded).
 	TransportSet Transport = "set"
 )
 
-// ParseTransport maps $HERDR_PDF_TRANSPORT onto a Transport, falling back
-// to the default for an empty or unrecognised value so a typo degrades to
-// "works, just not what you asked for" rather than a dead pane.
+// ParseTransport maps $HERDR_PDF_TRANSPORT onto a Transport, falling back to
+// the default (rather than failing) on an empty or unrecognised value.
 func ParseTransport(v string) Transport {
 	switch Transport(strings.ToLower(strings.TrimSpace(v))) {
 	case TransportStreamPNG:
@@ -96,10 +85,8 @@ func ParseTransport(v string) Transport {
 	}
 }
 
-// Options configures a Viewer. Fields are read directly from environment
-// variables by cmd/herdr-pdf; keeping them as plain fields (not reading
-// os.Getenv inside this package) is what makes Run() testable without a
-// real herdr pane.
+// Options configures a Viewer. Fields are set from environment variables by
+// cmd/herdr-pdf, keeping this package testable without a real herdr pane.
 type Options struct {
 	PDFPath   string // PDFVIEW_FILE, or argv[1]
 	PaneID    string // HERDR_PANE_ID
@@ -116,9 +103,8 @@ type Options struct {
 	Progressive *bool
 }
 
-// LogPath resolves where viewer.log should live: the plugin's own state
-// directory when running under herdr, /tmp otherwise (so it still produces
-// a log when run standalone for debugging).
+// LogPath resolves where viewer.log lives: the plugin's state directory
+// under herdr, or /tmp when run standalone.
 func LogPath() string {
 	if d := os.Getenv("HERDR_PLUGIN_STATE_DIR"); d != "" {
 		return filepath.Join(d, "viewer.log")
@@ -126,30 +112,34 @@ func LogPath() string {
 	return "/tmp/herdr-pdf-viewer.log"
 }
 
+// frameSink is the open stream a frame goes out on, taken as an interface so
+// the send path can be exercised without a herdr socket.
+type frameSink interface {
+	SendInline(format string, payload []byte, width, height int, placement herdr.Placement) error
+	SendFrame(pix []byte, width, height int, placement herdr.Placement) error
+	SendFile(format, path string, width, height int, placement herdr.Placement) error
+	Failed() error
+	Close() error
+}
+
 type Viewer struct {
 	opts     Options
 	renderer *render.Renderer
-	term     *ui.Terminal
-	stream   *herdr.StreamSession
+	term     ui.Screen
+	stream   frameSink
 	logf     *os.File
 
-	// layerID is resolved at startup, not fixed: TransportDirect must use
-	// "primary" to reach herdr's zero-copy path (see the const block).
+	// layerID is resolved at startup (TransportDirect forces "primary").
 	layerID   string
 	transport Transport
 
-	// frameDir is pane.graphics.info's file_frame_directory, and frameSeq
-	// rotates file names within it. Rotation matters: herdr keeps the
-	// leased file open while it draws (pane_graphics_files.rs:64-81), so
-	// overwriting the path we just sent could change the bytes underneath
-	// a frame still in flight.
+	// frameDir/frameSeq: RGBA frame file directory and its rotation counter
+	// (see writeFrameFile for why the name rotates).
 	frameDir string
 	frameSeq uint64
 
-	// info is cached between redraws. Re-fetching it on every keypress
-	// costs a fresh Unix-socket dial and a round trip through herdr's
-	// single-threaded headless event loop — the same loop that renders —
-	// so on a held-down j it queues behind the very work it is waiting on.
+	// info is cached between redraws: re-fetching on every keypress would
+	// round-trip herdr's single-threaded event loop, the same loop that renders.
 	infoMu      sync.Mutex
 	info        *herdr.GraphicsInfo
 	infoAt      time.Time
@@ -157,8 +147,7 @@ type Viewer struct {
 	infoRows    int
 	infoRefresh bool
 
-	// lastSetBytes carries the graphics.set fallback's payload size back
-	// out to the caller, which reports bytes for every transport uniformly.
+	// lastSetBytes carries the graphics.set payload size back for uniform logging.
 	lastSetBytes int
 
 	// lastBaseBytes is the truecolour size of the page just sent, logged so
@@ -176,9 +165,8 @@ type Viewer struct {
 	remote        bool
 	progressive   bool
 
-	// redrawGen invalidates a pending refinement: every redraw bumps it, so
-	// a refinement scheduled for a page the reader has already flipped past
-	// notices it has been superseded and sends nothing.
+	// redrawGen invalidates a pending refinement once the reader flips past
+	// the page it was scheduled for.
 	redrawGen atomic.Uint64
 
 	// lastDelta remembers which way the reader is moving so the prefetcher
@@ -186,11 +174,29 @@ type Viewer struct {
 	lastDelta int
 
 	// pngCache holds already-encoded frames, filled by the prefetcher.
-	// Guarded by pngMu because the prefetch goroutine writes it while the
-	// main loop reads it.
-	pngMu    sync.Mutex
-	pngCache map[pngKey]encodedPage
-	pngOrder []pngKey
+	// Guarded by pngMu: the prefetch goroutine writes it, the main loop reads it.
+	// pngPending marks frames an encode has been started for but not finished.
+	pngMu      sync.Mutex
+	pngCache   map[pngKey]encodedPage
+	pngOrder   []pngKey
+	pngPending map[pngKey]bool
+
+	// workMu guards the quit handshake: every background send registers on
+	// work under it, so a goroutine either starts before quitting is set and
+	// is waited for, or sees the flag and never starts.
+	workMu        sync.Mutex
+	work          sync.WaitGroup
+	quitting      bool
+	refineTimer   *time.Timer
+	pendingRefine *pendingRefine
+}
+
+// pendingRefine is the single queued full-resolution follow-up frame.
+type pendingRefine struct {
+	gen       uint64
+	full      render.Encoded
+	placement herdr.Placement
+	stream    frameSink
 }
 
 // encodedPage is one page compressed both ways: the full-resolution frame
@@ -200,52 +206,37 @@ type encodedPage struct {
 	preview render.Encoded
 }
 
-// pngKey identifies an encoded frame. Frame pixel dimensions are part of
-// the key, not just the page number, so a resize cannot serve a stale
-// encode at the old size.
+// pngKey identifies an encoded frame by page and pixel size, so a resize
+// cannot serve a stale encode at the old dimensions.
 type pngKey struct{ page, w, h int }
 
 // pngCacheCap matches the renderer's own cache: the current page plus both
 // neighbours, with room for one stale size left over from a resize.
 const pngCacheCap = 4
 
-// Frame size budgets, in bytes.
-//
-// A remote session reaches the terminal over SSH, which herdr neither
-// compresses nor pipelines: the payload is bincode'd uncompressed into the
-// same message as the pane's text surface, and the render channel to that
-// client holds one frame and drops rather than queues when it is busy
-// (server/client_transport.rs:119-124). 200 KB is the budget that keeps a
-// page comfortably inside one such message alongside the text.
-//
-// Locally the bytes only cross a Unix socket, so the budget is loose
-// enough that an ordinary page keeps full colour and never steps down.
+// Frame size budgets, in bytes. herdr never compresses anything on this
+// path, and the server->client channel holds only one frame and drops it
+// when busy (see herdr src server/client_transport.rs:119) — so byte count
+// directly drives latency. Remote (SSH) sessions get a tight budget; local
+// Unix-socket sessions don't need to.
 const (
 	remoteFrameBudget = 200 << 10
 	localFrameBudget  = 1500 << 10
 )
 
-// Progressive refinement parameters.
-//
-// previewBudget is sized to clear a slow link inside one render tick.
-// refineDelay is the pause before the full-resolution frame follows: it has
-// to exceed herdr's own render cadence (MIN_RENDER_INTERVAL = 16 ms,
-// app/mod.rs:38) or the server would coalesce both frames into one tick and
-// the preview would never be drawn at all, making the whole exercise a pure
-// cost. It is also the window in which a second keypress cancels the
-// refinement outright, so holding j down sends only previews — which is
-// exactly when sharpness matters least and latency matters most.
+// refineDelay must exceed herdr's ~16ms render cadence (MIN_RENDER_INTERVAL,
+// see herdr src app/mod.rs:38), or the server coalesces both frames into one
+// tick and the preview is never drawn. It also doubles as the cancel window:
+// a second keypress within refineDelay skips the refine entirely.
 const (
 	previewBudget = 32 << 10
 	refineDelay   = 90 * time.Millisecond
 )
 
-// infoTTL is how old a cached pane.graphics.info may get before a refresh
-// is started. Cell size is not actually stable for a pane — the same pane
-// reported 8x19 and 15x38 px in ARCH-review's "邊界案例矩陣" when a different
-// client attached — so it is re-read rather than trusted for the life of
-// the process. Expiry only *starts* a refresh; see graphicsInfo for why it
-// never makes a keypress wait for one.
+// infoTTL bounds how long a cached pane.graphics.info is trusted: cell size
+// is not stable across clients (a pane's reported pixel size can change
+// when a different client attaches), so it's re-read periodically. Expiry
+// only *starts* a refresh; see graphicsInfo for why a keypress never waits on one.
 const infoTTL = 2 * time.Second
 
 func New(opts Options) *Viewer {
@@ -256,15 +247,19 @@ func openLog(path string) *os.File {
 	if path == "" {
 		return nil
 	}
-	// Truncate once it grows past 1 MB rather than rotating — this is a
-	// diagnostic log for one plugin, not an audit trail (ARCH-review P2:
-	// viewer.log "無上限無輪替").
+	// Truncate once it grows past 1 MB rather than rotating: this is a
+	// diagnostic log for one plugin, not an audit trail.
 	if fi, err := os.Stat(path); err == nil && fi.Size() > 1<<20 {
 		_ = os.Truncate(path, 0)
 	}
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	// The log records the paths of documents the reader opens, so it stays
+	// owner-only even if an earlier run left it wider.
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
 		return nil
+	}
+	if fi, serr := f.Stat(); serr == nil && fi.Mode().Perm() != 0o600 {
+		_ = f.Chmod(0o600)
 	}
 	return f
 }
@@ -277,12 +272,8 @@ func (v *Viewer) log(format string, args ...interface{}) {
 	fmt.Fprintf(v.logf, ts+" "+format+"\n", args...)
 }
 
-// traceSpan accumulates per-stage durations for one redraw and emits them
-// as a single line when $HERDR_PDF_TRACE=1. It measures from keyAt — the
-// moment the keypress was pulled off the input channel — rather than from
-// the start of fullRedraw, because the question being answered is "how long
-// after I pressed j does the page change", and any wait before the redraw
-// begins counts against that just as much as the render does.
+// traceSpan accumulates per-stage durations for one redraw, measured from
+// keyAt (not fullRedraw's start) so queueing delay counts toward the total.
 type traceSpan struct {
 	v     *Viewer
 	on    bool
@@ -331,12 +322,9 @@ func msBetween(a, b time.Time) float64 {
 	return float64(b.Sub(a).Microseconds()) / 1000.0
 }
 
-// Run drives the viewer until the user quits, stdin hits EOF, or an
-// unrecoverable error occurs. Every return path leaves the terminal exactly
-// as it found it: raw-mode/alt-screen entry and its restoration are always
-// paired via defer, registered back-to-back with nothing risky in between,
-// and a top-level recover keeps a panic from a rendering bug leaving the
-// pane's terminal stuck in raw mode with a hidden cursor.
+// Run drives the viewer until the user quits, stdin hits EOF, or an error
+// occurs. Raw-mode entry/restore is always deferred, and a top-level
+// recover prevents a panic from leaving the terminal stuck in raw mode.
 func (v *Viewer) Run() (err error) {
 	v.logf = openLog(v.opts.LogPath)
 	defer func() {
@@ -363,9 +351,8 @@ func (v *Viewer) Run() (err error) {
 		return v.usageScreen("缺少 HERDR_PANE_ID，無法呼叫 pane.graphics API")
 	}
 
-	// pdfium init happens before raw mode: a cold ~1.3s wazero compile
-	// (G1-report) should show as a plain blocking process start, not a
-	// raw-mode screen with a hidden cursor and nothing on it.
+	// pdfium init happens before raw mode, so a slow cold wazero compile
+	// shows as a plain blocking start rather than a raw-mode screen with a hidden cursor.
 	r, rerr := render.NewRenderer(render.WazeroCacheDir())
 	if rerr != nil {
 		v.log("pdfium init failed: %v", rerr)
@@ -376,19 +363,14 @@ func (v *Viewer) Run() (err error) {
 
 	if oerr := r.Open(v.opts.PDFPath); oerr != nil {
 		v.log("open %s failed: %v", v.opts.PDFPath, oerr)
-		return v.usageScreen(fmt.Sprintf("無法開啟 PDF（詳見 viewer.log）: %s", filepath.Base(v.opts.PDFPath)))
+		return v.usageScreen(openFailureMessage(oerr, v.opts.PDFPath))
 	}
 
 	v.term = ui.New()
 	if terr := v.term.Enter(); terr != nil {
 		return fmt.Errorf("enter raw mode: %w", terr)
 	}
-	defer v.term.Restore()
-	defer func() {
-		if cerr := herdr.GraphicsClear(v.opts.PaneID, v.layerID); cerr != nil {
-			v.log("final graphics.clear: %v", cerr)
-		}
-	}()
+	defer v.shutdown()
 
 	v.resolveTransport()
 	if v.transport != TransportSet {
@@ -401,11 +383,6 @@ func (v *Viewer) Run() (err error) {
 	}
 	v.log("transport=%s layer=%s remote=%v progressive=%v max_frame_kb=%d frame_dir=%q trace=%v",
 		v.transport, v.layerID, v.remote, v.progressive, v.maxFrameBytes>>10, v.frameDir, v.opts.Trace)
-	defer func() {
-		if v.stream != nil {
-			v.stream.Close()
-		}
-	}()
 
 	v.fullRedraw()
 
@@ -415,6 +392,10 @@ func (v *Viewer) Run() (err error) {
 	sigCh := make(chan os.Signal, 4)
 	signal.Notify(sigCh, syscall.SIGWINCH)
 	defer signal.Stop(sigCh)
+
+	quitCh := make(chan os.Signal, 4)
+	signal.Notify(quitCh, quitSignals...)
+	defer signal.Stop(quitCh)
 
 	const resizeDebounce = 150 * time.Millisecond
 	var resizeTimer *time.Timer
@@ -426,11 +407,8 @@ func (v *Viewer) Run() (err error) {
 			if !ok {
 				return nil
 			}
-			// Stamped here rather than inside ReadKey so the measurement
-			// includes any time the event spent queued: the reader
-			// goroutine blocks on the fd, so this is within microseconds of
-			// the byte arriving, but a burst of held-down j keys shows up
-			// as real queueing rather than being hidden.
+			// Stamped here (not inside ReadKey) so held-down keys show real
+			// queueing delay rather than hiding it.
 			v.keyAt = time.Now()
 			if v.handleKey(ev) {
 				return nil
@@ -455,9 +433,7 @@ func (v *Viewer) Run() (err error) {
 			}
 
 		case <-sigCh:
-			// A resize is the one event that genuinely invalidates cached
-			// cell geometry, so drop the cache here instead of paying for a
-			// pane.graphics.info round trip on every page flip.
+			// Resize invalidates cached cell geometry.
 			v.infoMu.Lock()
 			v.info = nil
 			v.infoMu.Unlock()
@@ -471,8 +447,95 @@ func (v *Viewer) Run() (err error) {
 			resizeFire = nil
 			v.keyAt = time.Time{}
 			v.fullRedraw()
+
+		case sig := <-quitCh:
+			v.log("received signal %v, shutting down", sig)
+			return v.signalExit(sig)
 		}
 	}
+}
+
+// quitSignals end the session through the same teardown as the q key.
+var quitSignals = []os.Signal{syscall.SIGTERM, syscall.SIGHUP, syscall.SIGINT}
+
+// ExitSignal reports that Run stopped because of a termination signal.
+type ExitSignal struct{ Sig syscall.Signal }
+
+func (e *ExitSignal) Error() string { return "terminated by signal " + e.Sig.String() }
+
+// ExitCode is the status a shell expects after this signal.
+func (e *ExitSignal) ExitCode() int { return 128 + int(e.Sig) }
+
+// signalExit tears the pane down and reports the status to exit with.
+func (v *Viewer) signalExit(sig os.Signal) error {
+	v.shutdown()
+	if s, ok := sig.(syscall.Signal); ok {
+		return &ExitSignal{Sig: s}
+	}
+	return nil
+}
+
+// shutdown is the one quit path. It cancels any queued refinement, lets
+// in-flight background sends finish, and only then closes the stream, clears
+// the layer, and restores the terminal — so nothing writes to a connection
+// that is already gone. Calling it twice is a no-op.
+func (v *Viewer) shutdown() {
+	v.workMu.Lock()
+	if v.quitting {
+		v.workMu.Unlock()
+		return
+	}
+	v.quitting = true
+	v.redrawGen.Add(1)
+	if v.refineTimer != nil {
+		v.refineTimer.Stop()
+	}
+	v.pendingRefine = nil
+	v.workMu.Unlock()
+
+	v.work.Wait()
+
+	if v.stream != nil {
+		v.stream.Close()
+		v.stream = nil
+	}
+	if v.opts.PaneID != "" {
+		if cerr := herdr.GraphicsClear(v.opts.PaneID, v.layerID); cerr != nil {
+			v.log("final graphics.clear: %v", cerr)
+		}
+	}
+	if v.term != nil {
+		v.term.Restore()
+	}
+}
+
+// startWork runs fn on a goroutine the shutdown path waits for, and declines
+// to start one at all once the viewer is quitting.
+func (v *Viewer) startWork(fn func()) {
+	v.workMu.Lock()
+	if v.quitting {
+		v.workMu.Unlock()
+		return
+	}
+	v.work.Add(1)
+	v.workMu.Unlock()
+	go func() {
+		defer v.work.Done()
+		fn()
+	}()
+}
+
+// openFailureMessage explains an Open failure in the pane, so an encrypted
+// file does not read the same as a truncated one.
+func openFailureMessage(err error, path string) string {
+	name := filepath.Base(path)
+	switch {
+	case errors.Is(err, render.ErrEncrypted):
+		return fmt.Sprintf("此 PDF 需要密碼，尚不支援: %s", name)
+	case errors.Is(err, render.ErrCorrupt):
+		return fmt.Sprintf("檔案損毀或不是 PDF: %s", name)
+	}
+	return fmt.Sprintf("無法開啟 PDF（詳見 viewer.log）: %s", name)
 }
 
 // handleKey applies one key event to viewer state, returning true if the
@@ -560,7 +623,7 @@ func (v *Viewer) jumpOrLast() {
 }
 
 // confirmJump applies a pending numeric-prefix page jump (1-based input,
-// clamped into range), matching the "數字後接 G 或 Enter 跳頁" keybinding.
+// clamped into range).
 func (v *Viewer) confirmJump() {
 	if v.numBuf == "" {
 		return
@@ -600,6 +663,23 @@ func maxInt(a, b int) int {
 	return b
 }
 
+// clampRaster shrinks a canvas to the raster cap, keeping its aspect ratio.
+func clampRaster(w, h int) (int, int) {
+	if w <= maxRasterW && h <= maxRasterH {
+		return w, h
+	}
+	return fitBox(w, h, maxRasterW, maxRasterH)
+}
+
+// fitBox scales w x h to the largest size that fits inside maxW x maxH.
+func fitBox(w, h, maxW, maxH int) (int, int) {
+	if w <= 0 || h <= 0 {
+		return maxW, maxH
+	}
+	s := math.Min(float64(maxW)/float64(w), float64(maxH)/float64(h))
+	return maxInt(1, int(float64(w)*s)), maxInt(1, int(float64(h)*s))
+}
+
 func computePlacement(cols, drawRows, cellW, cellH, frameW, frameH int) herdr.Placement {
 	gridCols := ceilDiv(frameW, cellW)
 	gridRows := ceilDiv(frameH, cellH)
@@ -612,18 +692,9 @@ func computePlacement(cols, drawRows, cellW, cellH, frameW, frameH int) herdr.Pl
 }
 
 // resolveTransport picks the frame transport for this session and, for
-// TransportDirect, verifies up front that herdr will actually honour it.
-//
-// The check is not optional. file_frame_transport only reports
-// "direct-kitty" when the *client* handshake found a terminal worth using
-// it on (client/handshake.rs:57-84: ghostty/wezterm/kitty, not behind
-// ssh/tmux/screen, real tty on both ends), and even then the server ANDs
-// that with the layer being "primary" and the format being rgba
-// (app/api/pane_graphics.rs:312-315). Miss any of those and herdr silently
-// falls back to lease.copy_rgba() — a full re-read of the file we just
-// wrote — which is strictly worse than having sent the bytes inline. So a
-// direct transport that cannot be confirmed degrades to the PNG default
-// rather than quietly paying double.
+// TransportDirect, confirms up front that herdr will actually honour it —
+// otherwise herdr silently falls back to a full re-read of the file we just
+// wrote, which is worse than sending the bytes inline.
 func (v *Viewer) resolveTransport() {
 	v.transport = v.opts.Transport
 	if v.transport == "" {
@@ -631,13 +702,9 @@ func (v *Viewer) resolveTransport() {
 	}
 	v.layerID = namedLayerID
 
-	// file_frame_transport is negotiated by the client handshake, and it is
-	// only ever "direct-kitty" for a terminal on the same machine
-	// (client/handshake.rs:57-84 refuses it behind ssh/tmux/screen). An
-	// empty value therefore means one of two things — a remote client, or
-	// no client attached — and both of them mean inline frames over a link
-	// worth spending encode time to shorten. That makes it the signal for
-	// picking the frame budget as well as for refusing the direct path.
+	// An empty file_frame_transport means a remote client or no client at
+	// all — either way, inline frames over a link worth spending encode
+	// time to shrink.
 	info, err := herdr.PaneGraphicsInfo(v.opts.PaneID)
 	local := err == nil && info.FileFrameTransport == "direct-kitty" && info.FileFrameDirectory != ""
 	v.remote = !local
@@ -674,17 +741,9 @@ func (v *Viewer) resolveTransport() {
 	v.layerID = primaryLayerID
 }
 
-// graphicsInfo returns cell geometry, serving a stale value while a
-// refresh runs rather than making the keypress wait for one.
-//
-// The call is cheap when probed from outside the viewer (~0.4 ms), but
-// measured from inside it the first one after an idle gap consistently
-// costs ~106 ms, which at an ordinary reading pace lands on every single
-// page flip. The cause was not pinned down — an external prober with the
-// same idle gaps never reproduced it — so rather than rely on a theory
-// about why it is slow, the fix removes it from the critical path: only a
-// redraw with no usable cached geometry at all (startup, and the first
-// redraw after a resize changes the pane's cell dimensions) blocks on it.
+// graphicsInfo returns cell geometry, serving a stale cached value while a
+// refresh runs in the background rather than blocking the keypress on a
+// pane.graphics.info round trip (only startup and a post-resize redraw wait).
 func (v *Viewer) graphicsInfo(cols, drawRows int) (*herdr.GraphicsInfo, error) {
 	v.infoMu.Lock()
 	cached, at := v.info, v.infoAt
@@ -712,10 +771,9 @@ func (v *Viewer) storeInfo(info *herdr.GraphicsInfo, cols, drawRows int) {
 	v.infoMu.Unlock()
 }
 
-// refreshInfoAsync re-reads geometry on a background goroutine, at most one
-// at a time. A failure is left alone deliberately: the cached value is
-// still the best answer available, and a transient socket error must not
-// blank the page the reader is looking at.
+// refreshInfoAsync re-reads geometry on a background goroutine (at most one
+// at a time); a transient failure keeps the stale cached value rather than
+// blanking the page the reader is looking at.
 func (v *Viewer) refreshInfoAsync(cols, drawRows int) {
 	v.infoMu.Lock()
 	if v.infoRefresh {
@@ -736,21 +794,16 @@ func (v *Viewer) refreshInfoAsync(cols, drawRows int) {
 	}()
 }
 
-// showStatus repaints the text layer. The screen clear lives here, at the
-// last possible moment, rather than at the top of fullRedraw: clearing
-// first blanks the pane for the whole render-and-send window, which on the
-// RGBA transport was the largest visible part of a page flip.
+// showStatus repaints the text layer. The clear happens here, not at the
+// top of fullRedraw, so the pane isn't blank for the whole render-and-send window.
 func (v *Viewer) showStatus(cols, rows int, right string) {
-	ui.ClearScreen()
+	v.term.ClearScreen()
 	v.writeStatus(cols, rows, right)
 }
 
-// fullRedraw re-queries geometry, renders the current page to fit, pushes
-// it to the pane, and repaints the status line. Every failure path still
-// draws a status line explaining what went wrong instead of leaving the
-// pane blank with no clue (ARCH-review P0: viewer.py's error handling only
-// distinguished success/failure, never surfacing herdr's error.code, so a
-// user opening a scan on an unsupported terminal just saw "render 失敗").
+// fullRedraw re-queries geometry, renders the current page, sends it, and
+// repaints the status line. Every failure path still shows a status message
+// instead of leaving the pane blank.
 func (v *Viewer) fullRedraw() {
 	v.redrawGen.Add(1)
 	tr := v.beginTrace()
@@ -783,9 +836,10 @@ func (v *Viewer) fullRedraw() {
 
 	canvasW := cols * info.CellWidthPx
 	canvasH := drawRows * info.CellHeightPx
+	rasterW, rasterH := clampRaster(canvasW, canvasH)
 
 	t0 := time.Now()
-	frame, err := v.renderer.RenderPage(v.page, canvasW, canvasH)
+	frame, err := v.renderer.RenderPage(v.page, rasterW, rasterH)
 	renderMS := msSince(t0)
 	tr.mark("render")
 	if err != nil {
@@ -794,7 +848,13 @@ func (v *Viewer) fullRedraw() {
 		return
 	}
 
-	placement := computePlacement(cols, drawRows, info.CellWidthPx, info.CellHeightPx, frame.Width, frame.Height)
+	// A clamped raster is smaller than the pane, so placement describes the
+	// full-size box and lets herdr scale the image back up into it.
+	dispW, dispH := frame.Width, frame.Height
+	if rasterW != canvasW || rasterH != canvasH {
+		dispW, dispH = fitBox(frame.Width, frame.Height, canvasW, canvasH)
+	}
+	placement := computePlacement(cols, drawRows, info.CellWidthPx, info.CellHeightPx, dispW, dispH)
 
 	t1 := time.Now()
 	strategy, sentBytes, sendErr := v.sendFrame(frame, placement, cols, drawRows, info.CellWidthPx, info.CellHeightPx, tr)
@@ -817,27 +877,21 @@ func (v *Viewer) fullRedraw() {
 	tr.mark("status")
 	tr.done(fmt.Sprintf("page=%d strategy=%s sent_bytes=%d", v.page+1, strategy, sentBytes))
 
-	v.prefetchNeighbours(canvasW, canvasH)
+	v.prefetchNeighbours(rasterW, rasterH)
 }
 
 // prefetchNeighbours warms the pages either side of the current one on a
-// background goroutine, after the current page is already on screen.
-//
-// Rendering is the largest measured cost on the keypress path — 25-70 ms
-// for a fit-to-pane page, against ~0.3 ms for the geometry lookup and a few
-// ms for the socket write — and for sequential reading it is entirely
-// predictable work. Doing it in the gap between keypresses turns the next
-// flip's RenderPage into a cache hit. The pages to warm are chosen before
-// the goroutine starts, so it never reads viewer state the main loop is
-// concurrently mutating; pdfium calls serialise on the renderer's own lock.
-func (v *Viewer) prefetchNeighbours(canvasW, canvasH int) {
+// background goroutine after the current page is on screen, turning the
+// next flip's RenderPage into a cache hit. Pages to warm are chosen up
+// front so the goroutine never races the main loop's viewer state.
+func (v *Viewer) prefetchNeighbours(rasterW, rasterH int) {
 	order := []int{v.page + 1, v.page - 1}
 	if v.lastDelta < 0 {
 		order = []int{v.page - 1, v.page + 1}
 	}
 	var want []int
 	for _, p := range order {
-		if p >= 0 && p < v.renderer.PageCount() && !v.renderer.Cached(p, canvasW, canvasH) {
+		if p >= 0 && p < v.renderer.PageCount() && !v.renderer.Cached(p, rasterW, rasterH) {
 			want = append(want, p)
 		}
 	}
@@ -846,22 +900,29 @@ func (v *Viewer) prefetchNeighbours(canvasW, canvasH int) {
 	}
 	r := v.renderer
 	encodeToo := v.transport == TransportStreamPNG
-	go func() {
+	v.startWork(func() {
 		for _, p := range want {
-			frame, err := r.RenderPage(p, canvasW, canvasH)
+			frame, err := r.RenderPage(p, rasterW, rasterH)
 			if err != nil {
 				continue
 			}
 			if !encodeToo {
 				continue
 			}
+			// Claim the slot before the encode, not after: claiming after
+			// means two prefetchers can both spend the encode and only then
+			// discover one of them was redundant.
+			if !v.reservePNG(p, frame.Width, frame.Height) {
+				continue
+			}
 			enc, eerr := v.encodePage(frame)
 			if eerr != nil {
+				v.releasePNG(p, frame.Width, frame.Height)
 				continue
 			}
 			v.storePNGAt(p, frame, enc)
 		}
-	}()
+	})
 }
 
 func msSince(t0 time.Time) float64 {
@@ -876,16 +937,14 @@ func (v *Viewer) writeStatus(cols, rows int, right string) {
 	}
 	mid := fmt.Sprintf("頁 %d/%s  [j/k 翻頁 g/G 首尾 q 離開]", v.page+1, total)
 	line := ui.StatusLine(name, mid, right, cols)
-	os.Stdout.WriteString(ui.RenderStatusLine(rows, line))
+	v.term.WriteString(ui.RenderStatusLine(rows, line))
 }
 
-// errorStatus turns a herdr *Error (or any other error) into the specific,
-// actionable status-line message ARCH-review's P0 finding said viewer.py
-// was missing: it parsed only success/failure, never resp.error.code, so a
-// terminal without Kitty graphics support and a disabled feature flag both
-// rendered as the same opaque "render 失敗".
+// errorStatus turns a herdr *Error into an actionable status-line message
+// by switching on error.code, rather than a single generic failure string.
 func (v *Viewer) errorStatus(err error) string {
-	if he, ok := err.(*herdr.Error); ok {
+	var he *herdr.Error
+	if errors.As(err, &he) {
 		switch he.Code {
 		case "cell_size_unavailable":
 			return "此終端不支援 Kitty graphics"
@@ -899,20 +958,14 @@ func (v *Viewer) errorStatus(err error) string {
 			return "錯誤: " + he.Code
 		}
 	}
+	if errors.Is(err, render.ErrTooLarge) || errors.Is(err, herdr.ErrFrameTooLarge) {
+		return "此頁太大，未送出"
+	}
 	return "render 失敗，見 viewer.log"
 }
 
-// sendFrame pushes one rendered page using the configured transport,
-// falling back to the short-lived graphics.set PNG path whenever the
-// long-lived stream is unavailable or has failed.
-//
-// The transport choice is the whole performance story. All four end up as
-// Kitty graphics in the outer terminal, but they differ by more than an
-// order of magnitude in how many bytes get there: herdr applies no
-// compression of its own anywhere on this path — no zlib, no o=z — so
-// whatever the plugin hands over is what gets hashed, copied into the
-// inline layer, bincode-encoded onto the client wire uncompressed, then
-// base64-expanded 4:3 and cut into 3072-byte Kitty chunks.
+// sendFrame pushes one rendered page via the configured transport, falling
+// back to the short-lived graphics.set PNG path if the stream is unavailable.
 func (v *Viewer) sendFrame(frame *render.Frame, placement herdr.Placement, cols, drawRows, cellW, cellH int, tr *traceSpan) (strategy string, sentBytes int, err error) {
 	if v.stream != nil {
 		if failErr := v.stream.Failed(); failErr != nil {
@@ -926,6 +979,12 @@ func (v *Viewer) sendFrame(frame *render.Frame, placement herdr.Placement, cols,
 		strategy, sentBytes, err = v.sendViaStream(frame, placement, tr)
 		if err == nil {
 			return strategy, sentBytes, nil
+		}
+		// A frame refused for its size says nothing about the connection, so
+		// the stream stays open and the next page gets a fresh try on it.
+		if errors.Is(err, herdr.ErrFrameTooLarge) || errors.Is(err, render.ErrTooLarge) {
+			v.log("page=%d frame too large for the stream, not sent: %v", v.page+1, err)
+			return strategy, sentBytes, err
 		}
 		v.log("stream send failed (%s), falling back to graphics.set: %v", strategy, err)
 		v.stream.Close()
@@ -941,10 +1000,19 @@ func (v *Viewer) sendFrame(frame *render.Frame, placement herdr.Placement, cols,
 func (v *Viewer) sendViaStream(frame *render.Frame, placement herdr.Placement, tr *traceSpan) (strategy string, sentBytes int, err error) {
 	switch v.transport {
 	case TransportStreamRGBA:
-		if serr := v.stream.SendFrame(frame.RGBA, frame.Width, frame.Height, placement); serr != nil {
+		serr := v.stream.SendFrame(frame.RGBA, frame.Width, frame.Height, placement)
+		if serr == nil {
+			return "stream-rgba", len(frame.RGBA), nil
+		}
+		if !errors.Is(serr, herdr.ErrFrameTooLarge) {
 			return "stream-rgba", len(frame.RGBA), serr
 		}
-		return "stream-rgba", len(frame.RGBA), nil
+		// Uncompressed pixels overflow the frame limit long before a
+		// compressed page does, so the same page goes out as PNG rather than
+		// costing the session its stream.
+		v.log("rgba frame %dx%d over the stream limit, sending as png", frame.Width, frame.Height)
+		strategy, sentBytes, err = v.sendStreamPNG(frame, placement, tr)
+		return "rgba->" + strategy, sentBytes, err
 
 	case TransportDirect:
 		path, werr := v.writeFrameFile(frame)
@@ -952,59 +1020,61 @@ func (v *Viewer) sendViaStream(frame *render.Frame, placement herdr.Placement, t
 		if werr != nil {
 			return "direct", 0, werr
 		}
-		// Unlike an inline frame, this one has a real acknowledgement:
-		// herdr answers every file frame, success included
-		// (pane_graphics_stream.rs:253-254), so the time spent here is the
-		// server actually taking the frame rather than a socket write
-		// disappearing into a buffer.
+		// Unlike inline frames, herdr acknowledges every file frame (even
+		// success), so this measures the server actually taking it.
 		if serr := v.stream.SendFile("rgba", path, frame.Width, frame.Height, placement); serr != nil {
 			return "direct", len(frame.RGBA), serr
 		}
 		return "direct", len(frame.RGBA), nil
 
 	default: // TransportStreamPNG
-		// A prefetched encode is the common case while reading in one
-		// direction, which is what keeps the colour-depth ladder — up to
-		// three encodes of a 2.8 megapixel page — off the keypress path.
-		page, hit := v.lookupPNG(frame)
-		if !hit {
-			var eerr error
-			page, eerr = v.encodePage(frame)
-			if eerr != nil {
-				tr.mark("png_encode")
-				return "stream-png", 0, eerr
-			}
-			v.storePNGAt(v.page, frame, page)
-		}
-		if hit {
-			tr.mark("png_cached")
-		} else {
-			tr.mark("png_encode")
-		}
-		v.lastBaseBytes = page.full.BaseBytes
-
-		first := page.full
-		if v.progressive && page.preview.Payload != nil {
-			first = page.preview
-		}
-		if serr := v.sendEncoded(v.stream, first, placement); serr != nil {
-			return "stream-png", len(first.Payload), serr
-		}
-		if first.Strategy == page.full.Strategy {
-			return fmt.Sprintf("png:%s(%dKB)", page.full.Strategy, len(page.full.Payload)/1024), len(page.full.Payload), nil
-		}
-
-		v.scheduleRefine(page.full, placement)
-		return fmt.Sprintf("png:%s(%dKB)->%s(%dKB)",
-			first.Strategy, len(first.Payload)/1024,
-			page.full.Strategy, len(page.full.Payload)/1024), len(first.Payload), nil
+		return v.sendStreamPNG(frame, placement, tr)
 	}
+}
+
+// sendStreamPNG encodes the page and pushes it on the open stream, sending
+// the small stand-in first when progressive refinement is on.
+func (v *Viewer) sendStreamPNG(frame *render.Frame, placement herdr.Placement, tr *traceSpan) (strategy string, sentBytes int, err error) {
+	// A prefetch cache hit is the common case while reading in one
+	// direction, keeping the colour-depth ladder off the keypress path.
+	page, hit := v.lookupPNG(frame)
+	if !hit {
+		var eerr error
+		page, eerr = v.encodePage(frame)
+		if eerr != nil {
+			tr.mark("png_encode")
+			return "stream-png", 0, eerr
+		}
+		v.storePNGAt(v.page, frame, page)
+	}
+	if hit {
+		tr.mark("png_cached")
+	} else {
+		tr.mark("png_encode")
+	}
+	v.lastBaseBytes = page.full.BaseBytes
+
+	first := page.full
+	if v.progressive && page.preview.Payload != nil {
+		first = page.preview
+	}
+	if serr := v.sendEncoded(v.stream, first, placement); serr != nil {
+		return "stream-png", len(first.Payload), serr
+	}
+	if first.Strategy == page.full.Strategy {
+		return fmt.Sprintf("png:%s(%dKB)", page.full.Strategy, len(page.full.Payload)/1024), len(page.full.Payload), nil
+	}
+
+	v.scheduleRefine(page.full, placement)
+	return fmt.Sprintf("png:%s(%dKB)->%s(%dKB)",
+		first.Strategy, len(first.Payload)/1024,
+		page.full.Strategy, len(page.full.Payload)/1024), len(first.Payload), nil
 }
 
 // encodePage runs the colour ladder, plus the preview encode when
 // progressive refinement is on.
 func (v *Viewer) encodePage(frame *render.Frame) (encodedPage, error) {
-	full, err := render.EncodeAdaptive(frame, v.maxFrameBytes)
+	full, err := render.EncodeAdaptiveLimited(frame, v.maxFrameBytes, herdr.MaxInlineFrameBytes)
 	if err != nil {
 		return encodedPage{}, err
 	}
@@ -1019,41 +1089,57 @@ func (v *Viewer) encodePage(frame *render.Frame) (encodedPage, error) {
 	return out, nil
 }
 
-// sendEncoded pushes one encoded frame, always at the placement computed
-// for the page at full size.
-//
-// This is what makes a scaled-down encode usable. herdr writes the image's
-// own pixel size into the Kitty control as s= and v=, but takes c= and r=
-// — the cell box the image is drawn into — from the placement
-// (kitty_graphics.rs:799, :820). The terminal scales the image to fill that
-// box. So a half-size preview or a shrunk rung sent with the full page's
-// placement fills the same area, just softer, instead of appearing as a
-// smaller picture that snaps to size when the sharp frame replaces it.
-func (v *Viewer) sendEncoded(st *herdr.StreamSession, enc render.Encoded, placement herdr.Placement) error {
+// sendEncoded pushes one encoded frame at the placement computed for the
+// full-size page: herdr draws into the placement's cell box regardless of
+// the image's own pixel size, so a smaller preview still fills the same area.
+func (v *Viewer) sendEncoded(st frameSink, enc render.Encoded, placement herdr.Placement) error {
 	return st.SendInline("png", enc.Payload, enc.Width, enc.Height, placement)
 }
 
-// scheduleRefine sends the full-resolution frame a short time after the
-// preview, unless the reader has moved on in the meantime.
-//
-// The stream pointer is captured rather than re-read: if the main loop
-// tears the session down and falls back to graphics.set while this is in
-// flight, the send fails on a closed connection and is logged, instead of
-// racing the field the main loop is reassigning.
+// scheduleRefine queues the full-resolution frame behind the preview. At
+// most one refinement is ever pending: a faster reader replaces the payload
+// and resets the timer instead of stacking a goroutine per page. The stream
+// pointer is captured up front so a concurrent fallback to graphics.set
+// can't race this field.
 func (v *Viewer) scheduleRefine(full render.Encoded, placement herdr.Placement) {
-	gen := v.redrawGen.Load()
-	st := v.stream
-	go func() {
-		time.Sleep(refineDelay)
-		if v.redrawGen.Load() != gen {
-			return
-		}
-		if err := v.sendEncoded(st, full, placement); err != nil {
-			v.log("refine send failed: %v", err)
-			return
-		}
-		v.log("refine sent strategy=%s bytes=%d", full.Strategy, len(full.Payload))
-	}()
+	v.workMu.Lock()
+	defer v.workMu.Unlock()
+	if v.quitting {
+		return
+	}
+	v.pendingRefine = &pendingRefine{
+		gen:       v.redrawGen.Load(),
+		full:      full,
+		placement: placement,
+		stream:    v.stream,
+	}
+	if v.refineTimer == nil {
+		v.refineTimer = time.AfterFunc(refineDelay, v.sendRefine)
+		return
+	}
+	v.refineTimer.Stop()
+	v.refineTimer.Reset(refineDelay)
+}
+
+// sendRefine runs on the refine timer; the reader having moved on since the
+// preview, or a shutdown having started, cancels it.
+func (v *Viewer) sendRefine() {
+	v.workMu.Lock()
+	p := v.pendingRefine
+	v.pendingRefine = nil
+	if p == nil || p.stream == nil || v.quitting || v.redrawGen.Load() != p.gen {
+		v.workMu.Unlock()
+		return
+	}
+	v.work.Add(1)
+	v.workMu.Unlock()
+	defer v.work.Done()
+
+	if err := v.sendEncoded(p.stream, p.full, p.placement); err != nil {
+		v.log("refine send failed: %v", err)
+		return
+	}
+	v.log("refine sent strategy=%s bytes=%d", p.full.Strategy, len(p.full.Payload))
 }
 
 func (v *Viewer) lookupPNG(frame *render.Frame) (encodedPage, bool) {
@@ -1063,6 +1149,32 @@ func (v *Viewer) lookupPNG(frame *render.Frame) (encodedPage, bool) {
 	return e, ok
 }
 
+// reservePNG claims a cache slot before the encode starts, so a second
+// prefetch for the same frame skips the work rather than duplicating it.
+func (v *Viewer) reservePNG(page, w, h int) bool {
+	v.pngMu.Lock()
+	defer v.pngMu.Unlock()
+	k := pngKey{page, w, h}
+	if _, done := v.pngCache[k]; done {
+		return false
+	}
+	if v.pngPending[k] {
+		return false
+	}
+	if v.pngPending == nil {
+		v.pngPending = make(map[pngKey]bool)
+	}
+	v.pngPending[k] = true
+	return true
+}
+
+// releasePNG drops a claim whose encode did not produce anything.
+func (v *Viewer) releasePNG(page, w, h int) {
+	v.pngMu.Lock()
+	delete(v.pngPending, pngKey{page, w, h})
+	v.pngMu.Unlock()
+}
+
 func (v *Viewer) storePNGAt(page int, frame *render.Frame, enc encodedPage) {
 	v.pngMu.Lock()
 	defer v.pngMu.Unlock()
@@ -1070,6 +1182,7 @@ func (v *Viewer) storePNGAt(page int, frame *render.Frame, enc encodedPage) {
 		v.pngCache = make(map[pngKey]encodedPage)
 	}
 	k := pngKey{page, frame.Width, frame.Height}
+	delete(v.pngPending, k)
 	if _, exists := v.pngCache[k]; exists {
 		return
 	}
@@ -1082,14 +1195,10 @@ func (v *Viewer) storePNGAt(page int, frame *render.Frame, enc encodedPage) {
 }
 
 // writeFrameFile writes the RGBA buffer into pane.graphics.info's
-// file_frame_directory and returns its absolute path.
-//
-// The file name rotates over a small ring rather than being reused,
-// because herdr holds the leased file open and re-validates its size and
-// identity while drawing (pane_graphics_files.rs:64-81, 118-131).
-// Overwriting the path that a frame still in flight refers to would trip
-// "frame length changed while leased" at best and swap pixels underneath a
-// live draw at worst.
+// file_frame_directory and returns its path. The filename rotates over a
+// small ring rather than being reused, since herdr keeps the leased file
+// open and re-validates it while drawing — overwriting an in-flight path
+// could swap pixels mid-draw.
 func (v *Viewer) writeFrameFile(frame *render.Frame) (string, error) {
 	if v.frameDir == "" {
 		return "", fmt.Errorf("no file_frame_directory for direct transport")
@@ -1097,9 +1206,9 @@ func (v *Viewer) writeFrameFile(frame *render.Frame) (string, error) {
 	v.frameSeq++
 	name := fmt.Sprintf("herdr-pdf-%d.rgba", v.frameSeq%4)
 	path := filepath.Join(v.frameDir, name)
-	// Truncate-and-write rather than write-then-rename: herdr validates
-	// that the path is a direct child of the source directory and refuses
-	// to follow symlinks, and a rename would leave the old inode leased.
+	// Truncate-and-write, not write-then-rename: herdr refuses symlinks and
+	// requires a direct child of the source directory; a rename would leave
+	// the old inode leased.
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
 		return "", fmt.Errorf("create frame file: %w", err)
@@ -1114,13 +1223,9 @@ func (v *Viewer) writeFrameFile(frame *render.Frame) (string, error) {
 	return path, nil
 }
 
-// sendViaSet is the PNG-over-graphics.set fallback. It fixes two P0 bugs
-// ARCH-review found in viewer.py's equivalent loop: the shrink loop here
-// has a real termination condition (it stops re-encoding once a candidate
-// fits, and reports failure instead of silently sending an oversized PNG
-// after exhausting its attempts), and a rejection's error.code is inspected
-// so a genuine image_too_large retries the shrink instead of being treated
-// as a generic failure.
+// sendViaSet is the PNG-over-graphics.set fallback: it shrinks and retries
+// until a candidate fits under setMaxBytes, and reports failure rather than
+// sending an oversized image after exhausting its attempts.
 func (v *Viewer) sendViaSet(frame *render.Frame, cols, drawRows, cellW, cellH int) (strategy string, err error) {
 	cur := frame
 	scale := 1.0
@@ -1140,9 +1245,8 @@ func (v *Viewer) sendViaSet(frame *render.Frame, cols, drawRows, cellW, cellH in
 			if he, ok := setErr.(*herdr.Error); !ok || he.Code != "image_too_large" {
 				return "set", setErr
 			}
-			// image_too_large despite our own size check passing: the
-			// server compares decoded bytes, which can differ slightly
-			// from our PNG byte count. Fall through and shrink further.
+			// image_too_large despite our size check: server compares
+			// decoded bytes, which can differ from our PNG byte count.
 		}
 
 		var w, h int
@@ -1158,16 +1262,12 @@ func (v *Viewer) sendViaSet(frame *render.Frame, cols, drawRows, cellW, cellH in
 		cur = next
 	}
 
-	// Every P0 fix here in one place: unlike viewer.py's equivalent loop,
-	// which unconditionally returned the last (still oversized) PNG after
-	// exhausting its attempts, this reports failure and sends nothing.
 	return "set", fmt.Errorf("此頁太大：縮放 %d 次後仍超過 %dKB 上限，未送出", setMaxTries, setMaxBytes/1024)
 }
 
-// planShrink computes the next (scale, width, height) to retry rendering
-// at, or ok=false once attempt has reached setMaxTries. Kept pure (no I/O)
-// so the termination condition — the exact thing viewer.py got wrong — is
-// unit-testable without a live pdfium renderer or herdr socket.
+// planShrink computes the next (scale, width, height) to retry at, or
+// ok=false once attempts are exhausted. Kept pure (no I/O) so the
+// termination condition is unit-testable without a live renderer.
 func planShrink(attempt, baseW, baseH int, scale float64) (newScale float64, w, h int, ok bool) {
 	if attempt >= setMaxTries-1 {
 		return scale, 0, 0, false
@@ -1178,10 +1278,8 @@ func planShrink(attempt, baseW, baseH int, scale float64) (newScale float64, w, 
 	return newScale, w, h, true
 }
 
-// usageScreen shows a plain-text message and waits for q/Ctrl-C/EOF. Used
-// for every "can't even start" case (missing file, missing HERDR_PANE_ID,
-// pdfium init failure, a PDF that won't open) so the pane explains itself
-// instead of a bare shell error or a silently closed pane.
+// usageScreen shows a plain-text message and waits for q/Ctrl-C/EOF, used
+// for every "can't even start" case so the pane explains itself instead of a silent close.
 func (v *Viewer) usageScreen(reason string) error {
 	t := ui.New()
 	if err := t.Enter(); err != nil {
@@ -1190,11 +1288,11 @@ func (v *Viewer) usageScreen(reason string) error {
 	}
 	defer t.Restore()
 
-	ui.ClearScreen()
+	t.ClearScreen()
 	msg := "herdr PDF Viewer\r\n\r\n" + reason + "\r\n\r\n" +
 		"用法: 設定環境變數 PDFVIEW_FILE=/path/to/file.pdf 後開啟本 pane，\r\n" +
 		"或用 `herdr-pdf open /path/to/file.pdf`。\r\n\r\n按 q 離開。\r\n"
-	os.Stdout.WriteString("\x1b[1;1H" + msg)
+	t.WriteString("\x1b[1;1H" + msg)
 
 	reader := bufio.NewReader(os.Stdin)
 	for ev := range ui.StartKeyReader(reader) {
