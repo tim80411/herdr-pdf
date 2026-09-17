@@ -2,6 +2,8 @@
 
 在 herdr 的分割窗格裡直接看 PDF，不用離開終端機工作區。
 
+Repo／Release：<https://github.com/tim80411/herdr-pdf>
+
 <!-- TODO: screenshot -->
 
 ## 特色
@@ -18,18 +20,24 @@
 | 項目 | 需求 |
 | --- | --- |
 | herdr 版本 | 0.9.0 以上（manifest 宣告的 `min_herdr_version`） |
-| 作業系統 | macOS、Linux（manifest `platforms` 只列了這兩個，尚未宣告 Windows） |
+| 作業系統 | macOS、Linux；不支援 Windows（終端幾何依賴 unix ioctl） |
 | 終端機 | 需支援 Kitty Graphics Protocol（例如 Ghostty、kitty、WezTerm、iTerm2 3.6+），且 herdr 設定要開 `[terminal] kitty_graphics`（0.9.0 預設為開） |
 | 建置工具 | Go 1.26 或以上（`go.mod` 宣告 `go 1.26.0`）；只有在沒有對應平台的預編譯 release 可下載時，`build.sh` 才會 fallback 用它從原始碼建置 |
 
 ## 安裝
 
 ```sh
-herdr plugin install <owner>/herdr-pdf
+herdr plugin install tim80411/herdr-pdf
 herdr plugin enable pdf   # 若沒有自動啟用
 ```
 
 `[[build]]` 會跑 manifest 宣告的 `./build.sh`：先依版本與平台去 GitHub Release 抓對應的預編譯 binary、驗 SHA-256，成功就直接安裝；抓不到（沒有網路、沒有對應 release、驗證失敗）才 fallback 用本機 Go 工具鏈建置。可用環境變數覆寫這個流程：`HERDR_PDF_RELEASE_BASE`（換下載來源）、`HERDR_PDF_FORCE_BUILD=1`（跳過下載、強制本機建置）、`HERDR_PDF_SKIP_BUILD_FALLBACK=1`（下載失敗就直接報錯，不 fallback）。
+
+| 情境 | 怎麼做 |
+| --- | --- |
+| 指定版本 | `herdr plugin install tim80411/herdr-pdf --ref v0.2.0` |
+| 升級 | 重新執行一次 `herdr plugin install tim80411/herdr-pdf`（herdr 沒有獨立的 update 子命令） |
+| 這台機器先前用 `link` 掛過 | 先 `herdr plugin unlink pdf`，再 install |
 
 開發這個 plugin 本身時改用本地連結，這樣改完程式碼重新 build 才會反映到執行檔：
 
@@ -53,6 +61,22 @@ herdr plugin enable pdf
    herdr plugin action invoke open --plugin pdf
    ```
    要注意：action id 是 `open`，plugin 要另外用 `--plugin pdf` 指定，**不是**單一字串 `pdf.open`（用 `herdr plugin action list --plugin pdf` 可以看到回傳的是 `"action_id":"open"` 搭配獨立的 `"plugin_id":"pdf"`）。這個子命令的 `--help` 只列出 `--plugin <ID>` 一個選項，沒有能夾帶檔案路徑的位置參數，所以手動下這行指令時，PDF 路徑要靠 herdr 幫這次 action 準備好的點擊內容（`HERDR_PLUGIN_CLICKED_URL` 或 context JSON）才能解出來；日常操作建議用方式 1 或 2，這個方式比較適合已經有點擊上下文的場景。
+
+## 快捷鍵
+
+也可以在 herdr 的 `config.toml` 綁一個快捷鍵直接觸發開啟動作：
+
+```toml
+[[keys.command]]
+key = "prefix+p"
+type = "plugin_action"
+command = "pdf.open"
+description = "open selected PDF path in a split pane"
+```
+
+- 這裡的 `command` 要寫成合併字串 `<plugin id>.<action id>`，所以是 `pdf.open`——跟前一節 CLI 的 `herdr plugin action invoke` 要拆成 `open --plugin pdf` 兩個獨立參數是不同格式，兩處介面不同，別弄混。
+- 按下快捷鍵時，action 讀 herdr 準備好的 context：先看目前選取的文字（`selected_text`）是不是 `.pdf` 路徑，相對路徑會以觸發當下那個 pane 的 cwd 補成絕對路徑；沒有選取任何文字就會找不到路徑，窗格開不起來。
+- 改完 `~/.config/herdr/config.toml` 要跑 `herdr server reload-config` 才會生效。
 
 ## 鍵位
 
@@ -157,7 +181,6 @@ Roadmap（原始碼裡已經預留的擴充點）：
 
 | 項目 | 目前狀態 |
 | --- | --- |
-| 預編譯二進位分發（fetch-or-build，`build.sh` 實作） | 已完成，見上方安裝段落；GitHub Release 目前還沒發佈過任何 tag，發佈前一律走原始碼建置 fallback |
 | `direct-kitty` 零複製檔案傳輸 | 程式碼裡已經有這個 transport 選項，但需要 herdr 用戶端握手支援才會真的生效，沒握手成功會自動退回 PNG 串流 |
 | 搜尋高亮／大綱疊層 | viewer 目前用的圖層 id 是 `page` 而不是 `primary`，就是為了讓未來這類疊層可以用另一個圖層，不用跟目前畫面搶同一層 |
 
@@ -189,24 +212,27 @@ MIT License（見 `LICENSE`）。
 ### Requirements
 
 - herdr 0.9.0 or newer (the manifest's declared `min_herdr_version`)
-- macOS or Linux (the manifest's declared `platforms`; Windows is not listed yet)
+- macOS or Linux; Windows is not supported (terminal geometry relies on Unix ioctls)
 - A terminal with Kitty Graphics Protocol support (Ghostty, kitty, WezTerm, iTerm2 3.6+), with `[terminal] kitty_graphics` enabled in herdr's config
 - Go 1.26 or newer (`go.mod` pins 1.26.0) — only needed as a fallback when no prebuilt release binary matches your platform
 
 ### Install
 
 ```sh
-herdr plugin install <owner>/herdr-pdf
+herdr plugin install tim80411/herdr-pdf
 herdr plugin enable pdf   # if it doesn't come up enabled
 ```
 
 `[[build]]` runs `./build.sh`, which downloads a version- and platform-matched, SHA-256-verified prebuilt binary from the GitHub release first, and only falls back to a local `go build` on a miss (no network, no matching release, checksum failure). For plugin development, use `herdr plugin link /path/to/herdr-pdf` instead so rebuilds pick up local source changes.
+
+Pin a version with `--ref v0.2.0`; to upgrade, just re-run `herdr plugin install tim80411/herdr-pdf` (herdr has no separate update subcommand). If this machine previously had the plugin linked, run `herdr plugin unlink pdf` first.
 
 ### Usage
 
 - Ctrl+click any `.pdf` path or `file://` link in a herdr pane.
 - Or run the opener binary directly: `./bin/herdr-pdf open /path/to/file.pdf`
 - Or invoke the action through herdr's CLI: `herdr plugin action invoke open --plugin pdf` — note the action id is `open` with a separate `--plugin pdf` flag, not a combined `pdf.open`. This form has no CLI slot for a file path, so it depends on herdr's own click context to resolve one; prefer the two options above for everyday use.
+- Or bind a key in herdr's `config.toml` (`[[keys.command]]`, `type = "plugin_action"`, `command = "pdf.open"` — the combined `<plugin>.<action>` form, unlike the CLI's separate `open --plugin pdf`); it opens whatever `.pdf` path is currently selected in the pane, resolved against that pane's cwd. Run `herdr server reload-config` after editing.
 
 ### Keys
 
