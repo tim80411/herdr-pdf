@@ -4,8 +4,8 @@
 // selection made in the outer terminal emulator never reaches herdr — so
 // the pane has to be able to ask which file, rather than fail.
 //
-// Nothing here draws graphics; browsing is plain text, and the graphics
-// stream is only opened once a file has been chosen.
+// Nothing here draws graphics; browsing is plain text, and no image is
+// sent until a file has been chosen.
 package browser
 
 import (

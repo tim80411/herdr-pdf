@@ -1,14 +1,13 @@
 # herdr-plugin.toml — manifest for the herdr PDF Viewer plugin.
 #
-# Renders a PDF page as pixels and paints it into a herdr split pane via
-# herdr's socket API — pane.graphics.stream carrying PNG frames by default,
-# falling back to pane.graphics.set (base64 PNG, 512 KiB cap) only if the
-# stream can't be opened or fails mid-session (KGP/Kitty-graphics-capable
-# terminal required on the herdr client side either way). PNG rather than
-# raw RGBA because herdr never decodes it and never compresses anything
-# itself, so a ~3.7 MB RGBA frame would reach the terminal as ~4.9 MB of
-# base64 escape text per keypress against ~0.44 MB for the same page as
-# PNG; see README for the full path and the HERDR_PDF_TRANSPORT override.
+# Renders a PDF page as pixels and paints it into a herdr split pane as
+# Kitty graphics protocol escapes (chunked base64 PNG) written to the pane's
+# own output — herdr 0.9.2 removed the pane.graphics.* socket API. A
+# KGP-capable terminal is required on the herdr client side. PNG rather than
+# raw RGBA because herdr never compresses anything itself, so a ~3.7 MB RGBA
+# frame would reach the terminal as ~4.9 MB of base64 escape text per
+# keypress against ~0.44 MB for the same page as PNG; see README for the
+# full path.
 # j/k (and arrows) page through the document.
 #
 # id charset is validated by herdr's normalize_identifier(): ASCII
@@ -18,9 +17,9 @@
 
 id = "pdf"
 name = "PDF Viewer"
-version = "0.3.1"
+version = "0.3.2"
 description = "View PDF files as rendered pages in a herdr split pane."
-min_herdr_version = "0.9.0"
+min_herdr_version = "0.9.2"
 platforms = ["macos", "linux"]
 
 # Installs bin/herdr-pdf: downloads a version-matched, SHA-256-verified

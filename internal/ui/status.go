@@ -74,7 +74,7 @@ func TruncateKeepTail(s string, maxWidth int) string {
 
 // StatusLine lays out the bottom row's content (without paint escapes — see
 // RenderStatusLine): name (left, truncated to fit), mid (center — page
-// indicator + key hints), right (render/stream diagnostics), padded to
+// indicator + key hints), right (render diagnostics), padded to
 // exactly cols-1 display columns. It never fills the last column, since
 // doing so on a CJK-heavy name would trip the terminal's autowrap and scroll the pane.
 func StatusLine(name, mid, right string, cols int) string {

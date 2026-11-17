@@ -25,7 +25,7 @@ import (
 // version is bumped independently of herdr-plugin.toml's manifest version;
 // it identifies this binary for viewer.log / bug reports. A release build
 // overrides it with -ldflags "-X main.version=...".
-var version = "0.3.1"
+var version = "0.3.2"
 
 const usage = `usage: herdr-pdf <command> [args]
 
@@ -65,6 +65,7 @@ func runView(args []string) int {
 	if pdfPath == "" && len(args) > 0 {
 		pdfPath = args[0]
 	}
+	transport, legacyTransport := viewer.ParseTransport(os.Getenv("HERDR_PDF_TRANSPORT"))
 	opts := viewer.Options{
 		PDFPath: pdfPath,
 		// Where browser mode starts when no file was named. Nothing expands
@@ -75,10 +76,13 @@ func runView(args []string) int {
 		LogPath:  viewer.LogPath(),
 		// Both knobs are read here rather than inside the viewer package so
 		// Run() stays testable without a real pane or a mutated environment.
-		Transport:   viewer.ParseTransport(os.Getenv("HERDR_PDF_TRANSPORT")),
+		Transport:   transport,
 		Trace:       isTruthy(os.Getenv("HERDR_PDF_TRACE")),
 		MaxFrameKB:  atoiDefault(os.Getenv("HERDR_PDF_MAX_FRAME_KB"), 0),
 		Progressive: tristate(os.Getenv("HERDR_PDF_PROGRESSIVE")),
+	}
+	if legacyTransport {
+		opts.LegacyTransport = os.Getenv("HERDR_PDF_TRANSPORT")
 	}
 	if err := viewer.New(opts).Run(); err != nil {
 		// A termination signal is a clean stop, reported with the status a

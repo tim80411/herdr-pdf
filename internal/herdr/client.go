@@ -1,13 +1,12 @@
 // Package herdr implements the client side of herdr's socket API:
 // newline-delimited JSON over a Unix domain socket at $HERDR_SOCKET_PATH.
 // The server handles exactly one request per connection then closes, so
-// Call always dials fresh; pane.graphics.stream is the one exception (see
-// stream.go), which hands the connection off to a different handler entirely.
+// Call always dials fresh. Drawing does not go through here: since herdr
+// 0.9.2 images are Kitty graphics escapes on the pane's own output.
 package herdr
 
 import (
 	"bufio"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -115,28 +114,6 @@ func Call(method string, params interface{}, result interface{}) error {
 	return nil
 }
 
-// GraphicsInfo is the result of pane.graphics.info.
-type GraphicsInfo struct {
-	CellWidthPx        int    `json:"cell_width_px"`
-	CellHeightPx       int    `json:"cell_height_px"`
-	PaneVisible        bool   `json:"pane_visible"`
-	FileFrameTransport string `json:"file_frame_transport"`
-	FileFrameDirectory string `json:"file_frame_directory"`
-	MaxLayersPerPane   int    `json:"max_layers_per_pane"`
-}
-
-// PaneGraphicsInfo fetches cell pixel geometry for paneID. Cell size is not
-// stable across clients or even across calls to the same pane, so this
-// function never caches — callers that want caching (see the viewer
-// package) must add their own TTL on top.
-func PaneGraphicsInfo(paneID string) (*GraphicsInfo, error) {
-	var info GraphicsInfo
-	if err := Call("pane.graphics.info", map[string]string{"pane_id": paneID}, &info); err != nil {
-		return nil, err
-	}
-	return &info, nil
-}
-
 type paneRect struct {
 	PaneID string `json:"pane_id"`
 	Rect   struct {
@@ -167,37 +144,4 @@ func PaneCells(paneID string) (cols, rows int, err error) {
 		}
 	}
 	return 0, 0, fmt.Errorf("pane %s not found in layout", paneID)
-}
-
-// Placement describes where a graphics layer sits in the pane's cell grid.
-type Placement struct {
-	ViewportCol int `json:"viewport_col"`
-	ViewportRow int `json:"viewport_row"`
-	GridCols    int `json:"grid_cols"`
-	GridRows    int `json:"grid_rows"`
-}
-
-// GraphicsSet pushes a PNG-encoded page image via the short-lived
-// pane.graphics.set call. This is the fallback path used only when the
-// long-lived stream (see stream.go) fails or is unavailable, because it is
-// capped at 512 KiB decoded (PANE_GRAPHICS_SET_MAX_BYTES) versus the
-// stream's 16 MiB.
-func GraphicsSet(paneID string, pngBytes []byte, width, height int, layerID string, placement Placement) error {
-	params := map[string]interface{}{
-		"pane_id":      paneID,
-		"format":       "png",
-		"image_width":  width,
-		"image_height": height,
-		"data_base64":  base64.StdEncoding.EncodeToString(pngBytes),
-		"layer_id":     layerID,
-		"z_index":      0,
-		"placement":    placement,
-	}
-	return Call("pane.graphics.set", params, nil)
-}
-
-// GraphicsClear removes a layer. Errors are non-fatal to callers (best
-// effort cleanup on exit).
-func GraphicsClear(paneID, layerID string) error {
-	return Call("pane.graphics.clear", map[string]string{"pane_id": paneID, "layer_id": layerID}, nil)
 }

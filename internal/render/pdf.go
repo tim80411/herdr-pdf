@@ -22,7 +22,7 @@ import (
 )
 
 // Frame is one rendered page: exactly Width*Height*4 bytes of straight RGBA
-// with no row padding, ready to hand to herdr's stream or set APIs.
+// with no row padding, ready to encode and send.
 type Frame struct {
 	Width  int
 	Height int

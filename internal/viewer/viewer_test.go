@@ -18,7 +18,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/tim80411/herdr-pdf/internal/herdr"
+	"github.com/tim80411/herdr-pdf/internal/kgp"
 	"github.com/tim80411/herdr-pdf/internal/render"
 	"github.com/tim80411/herdr-pdf/internal/ui"
 )
@@ -70,61 +70,6 @@ func TestComputePlacementNeverNegativeOffset(t *testing.T) {
 	}
 }
 
-func TestPlanShrinkTerminatesAfterMaxTries(t *testing.T) {
-	// planShrink must report ok=false once the attempt budget is
-	// exhausted, so the caller can give up and send nothing instead of an
-	// oversized image.
-	scale := 1.0
-	shrinks := 0
-	for attempt := 0; attempt < setMaxTries; attempt++ {
-		var ok bool
-		var w, h int
-		scale, w, h, ok = planShrink(attempt, 1000, 1000, scale)
-		if !ok {
-			break
-		}
-		shrinks++
-		if w <= 0 || h <= 0 {
-			t.Fatalf("attempt %d: non-positive dimensions %dx%d", attempt, w, h)
-		}
-	}
-	if shrinks != setMaxTries-1 {
-		t.Errorf("got %d shrink steps, want exactly %d (setMaxTries-1)", shrinks, setMaxTries-1)
-	}
-	// One more call past the budget must still say no.
-	if _, _, _, ok := planShrink(setMaxTries-1, 1000, 1000, scale); ok {
-		t.Errorf("planShrink at attempt=setMaxTries-1 should refuse, got ok=true")
-	}
-	if _, _, _, ok := planShrink(setMaxTries, 1000, 1000, scale); ok {
-		t.Errorf("planShrink at attempt=setMaxTries should refuse, got ok=true")
-	}
-}
-
-func TestPlanShrinkMonotonicallyShrinks(t *testing.T) {
-	scale := 1.0
-	prevW, prevH := 1000, 1000
-	for attempt := 0; attempt < setMaxTries-1; attempt++ {
-		var w, h int
-		var ok bool
-		scale, w, h, ok = planShrink(attempt, 1000, 1000, scale)
-		if !ok {
-			t.Fatalf("attempt %d: expected ok=true", attempt)
-		}
-		if w >= prevW || h >= prevH {
-			t.Errorf("attempt %d: %dx%d did not shrink from %dx%d", attempt, w, h, prevW, prevH)
-		}
-		prevW, prevH = w, h
-	}
-}
-
-func TestPlanShrinkNeverZero(t *testing.T) {
-	// Even a tiny base size must never shrink to 0 (which would make an
-	// invalid render request).
-	if _, w, h, ok := planShrink(0, 1, 1, 1.0); ok && (w <= 0 || h <= 0) {
-		t.Errorf("planShrink produced non-positive size %dx%d", w, h)
-	}
-}
-
 func TestEncodeAdaptiveRoundTrips(t *testing.T) {
 	w, h := 4, 3
 	pix := make([]byte, w*h*4)
@@ -171,19 +116,21 @@ func TestHandleKeyNumericPrefixAndG(t *testing.T) {
 }
 
 func TestParseTransport(t *testing.T) {
-	// An unrecognised or empty value must not disable rendering; it falls
-	// back to the default so a typo in $HERDR_PDF_TRANSPORT degrades to
-	// "not the transport you asked for" rather than a blank pane.
-	for in, want := range map[string]Transport{
-		"stream-png":  TransportStreamPNG,
-		"stream-rgba": TransportStreamRGBA,
-		"  DIRECT  ":  TransportDirect,
-		"Set":         TransportSet,
-		"":            TransportStreamPNG,
-		"nonsense":    TransportStreamPNG,
+	// Every value, including the removed socket transports and typos, lands
+	// on the kitty transport; only a non-empty non-kitty value is "legacy".
+	for in, legacy := range map[string]bool{
+		"":            false,
+		"kitty":       false,
+		"  KITTY ":    false,
+		"stream-png":  true,
+		"stream-rgba": true,
+		"  DIRECT  ":  true,
+		"Set":         true,
+		"nonsense":    true,
 	} {
-		if got := ParseTransport(in); got != want {
-			t.Errorf("ParseTransport(%q) = %q, want %q", in, got, want)
+		got, gotLegacy := ParseTransport(in)
+		if got != TransportKitty || gotLegacy != legacy {
+			t.Errorf("ParseTransport(%q) = %q,%v want %q,%v", in, got, gotLegacy, TransportKitty, legacy)
 		}
 	}
 }
@@ -297,7 +244,7 @@ func TestShutdownWaitsForBackgroundWorkThenRestores(t *testing.T) {
 	// A burst of page flips: each queues a refinement, replacing the last.
 	for i := 0; i < 50; i++ {
 		v.redrawGen.Add(1)
-		v.scheduleRefine(render.Encoded{Strategy: "full", Payload: []byte{byte(i)}}, herdr.Placement{})
+		v.scheduleRefine(render.Encoded{Strategy: "full", Payload: []byte{byte(i)}}, kgp.Placement{})
 	}
 	// Plus background jobs standing in for prefetch and resize work.
 	var finished atomic.Int32
@@ -353,7 +300,7 @@ func TestScheduleRefineKeepsOnlyTheLatestPending(t *testing.T) {
 
 	for i := 0; i < 50; i++ {
 		v.redrawGen.Add(1)
-		v.scheduleRefine(render.Encoded{Strategy: strconv.Itoa(i), Payload: []byte{byte(i)}}, herdr.Placement{})
+		v.scheduleRefine(render.Encoded{Strategy: strconv.Itoa(i), Payload: []byte{byte(i)}}, kgp.Placement{})
 		if i == 0 {
 			v.workMu.Lock()
 			firstTimer = v.refineTimer
@@ -543,86 +490,21 @@ func TestOpenFailureMessageDistinguishesCauses(t *testing.T) {
 	}
 }
 
-func TestErrorStatusUsesWrappedHerdrCodes(t *testing.T) {
+func TestErrorStatusClassifiesFailures(t *testing.T) {
 	v := &Viewer{}
-	// A herdr error reached through a wrapper must still be classified.
-	wrapped := fmt.Errorf("stream send failed: %w", &herdr.Error{Code: "image_too_large", Message: "nope"})
-	if got := v.errorStatus(wrapped); got != "此頁太大，見 viewer.log" {
-		t.Errorf("errorStatus = %q, want the image_too_large message", got)
-	}
 	if got := v.errorStatus(fmt.Errorf("encode: %w", render.ErrTooLarge)); !strings.Contains(got, "太大") {
 		t.Errorf("errorStatus = %q, want an over-size message for render.ErrTooLarge", got)
 	}
-	if got := v.errorStatus(fmt.Errorf("send: %w", herdr.ErrFrameTooLarge)); !strings.Contains(got, "太大") {
-		t.Errorf("errorStatus = %q, want an over-size message for herdr.ErrFrameTooLarge", got)
+	if got := v.errorStatus(&writeError{errors.New("broken pipe")}); !strings.Contains(got, "寫入終端") {
+		t.Errorf("errorStatus = %q, want a terminal-write message", got)
 	}
-}
-
-// fakeStream records what the viewer sends and applies the same size limit
-// the real stream enforces, so the send path can be driven without a socket.
-type fakeStream struct {
-	mu      sync.Mutex
-	limit   int // 0 means herdr.MaxInlineFrameBytes
-	sendErr error
-
-	inlineFormats []string
-	inlineBytes   []int
-	frameAttempts int
-	closes        int
-}
-
-func (f *fakeStream) cap() int {
-	if f.limit > 0 {
-		return f.limit
+	for _, bad := range []string{"kitty_graphics", "pane.graphics"} {
+		for _, err := range []error{render.ErrTooLarge, &writeError{errors.New("x")}, errors.New("y")} {
+			if got := v.errorStatus(err); strings.Contains(got, bad) {
+				t.Errorf("errorStatus(%v) = %q mentions the removed %s", err, got, bad)
+			}
+		}
 	}
-	return herdr.MaxInlineFrameBytes
-}
-
-func (f *fakeStream) SendInline(format string, payload []byte, width, height int, placement herdr.Placement) error {
-	if f.sendErr != nil {
-		return f.sendErr
-	}
-	if len(payload) > f.cap() {
-		return fmt.Errorf("%w: %s frame is %d bytes, limit is %d", herdr.ErrFrameTooLarge, format, len(payload), f.cap())
-	}
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.inlineFormats = append(f.inlineFormats, format)
-	f.inlineBytes = append(f.inlineBytes, len(payload))
-	return nil
-}
-
-func (f *fakeStream) SendFrame(pix []byte, width, height int, placement herdr.Placement) error {
-	f.mu.Lock()
-	f.frameAttempts++
-	f.mu.Unlock()
-	return f.SendInline("rgba", pix, width, height, placement)
-}
-
-func (f *fakeStream) SendFile(format, path string, width, height int, placement herdr.Placement) error {
-	return f.sendErr
-}
-
-func (f *fakeStream) Failed() error { return nil }
-
-func (f *fakeStream) Close() error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.closes++
-	return nil
-}
-
-// closeCount reports how many times the stream was closed.
-func (f *fakeStream) closeCount() int {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.closes
-}
-
-func (f *fakeStream) snapshot() ([]string, []int, int, int) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return append([]string(nil), f.inlineFormats...), append([]int(nil), f.inlineBytes...), f.frameAttempts, f.closes
 }
 
 // blankFrame builds a uniform RGBA page, which compresses to almost nothing
@@ -635,95 +517,161 @@ func blankFrame(w, h int) *render.Frame {
 	return &render.Frame{Width: w, Height: h, RGBA: pix}
 }
 
-func TestOversizedRGBAFallsBackToPNGOnTheSameStream(t *testing.T) {
-	// A page rendered at the raster cap is ~29 MiB of RGBA, well past the
-	// inline frame limit, so a tall pane hits this on its very first page.
-	frame := blankFrame(maxRasterW, maxRasterH)
-	if len(frame.RGBA) <= herdr.MaxInlineFrameBytes {
-		t.Fatalf("a %dx%d raster is %d bytes, which no longer exceeds the %d frame limit; this test needs an over-limit frame",
-			maxRasterW, maxRasterH, len(frame.RGBA), herdr.MaxInlineFrameBytes)
-	}
+// lockedBuf is a pane output that tolerates the refine goroutine writing.
+type lockedBuf struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
 
-	fs := &fakeStream{}
-	v := &Viewer{transport: TransportStreamRGBA, stream: fs, maxFrameBytes: localFrameBudget}
+func (l *lockedBuf) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.Write(p)
+}
 
-	strategy, sent, err := v.sendFrame(frame, herdr.Placement{}, 80, 24, 8, 16, v.beginTrace())
+func (l *lockedBuf) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.String()
+}
+
+func (l *lockedBuf) Reset() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.b.Reset()
+}
+
+// failWriter refuses every write.
+type failWriter struct{}
+
+func (failWriter) Write([]byte) (int, error) { return 0, errors.New("broken pipe") }
+
+func TestSendFrameWritesOneChunkedPNGAndReportsBytes(t *testing.T) {
+	out := &lockedBuf{}
+	v := &Viewer{out: out, maxFrameBytes: localFrameBudget}
+
+	strategy, sent, err := v.sendFrame(blankFrame(64, 64), kgp.Placement{ViewportCol: 1, ViewportRow: 2, GridCols: 8, GridRows: 4}, v.beginTrace())
 	if err != nil {
 		t.Fatalf("sendFrame: %v", err)
 	}
-
-	if v.stream == nil {
-		t.Error("an over-size frame tore down the connection; the session is now stuck on graphics.set")
+	got := out.String()
+	if !strings.HasPrefix(got, "\x1b[3;2H\x1b_Ga=T,f=100,t=d,i=1,c=8,r=4,C=1,q=2,m=") {
+		t.Errorf("output starts %q, want cursor move then the transmit header", got[:min(len(got), 60)])
 	}
-	formats, sizes, attempts, closes := fs.snapshot()
-	if closes != 0 {
-		t.Errorf("stream was closed %d times, want 0", closes)
+	if strings.Contains(got, "a=d") {
+		t.Errorf("first image must not delete anything: %q", got)
 	}
-	if attempts != 1 {
-		t.Errorf("rgba send attempts = %d, want 1", attempts)
+	if !strings.Contains(strategy, "png") || sent <= 0 {
+		t.Errorf("strategy=%q sent=%d, want a png strategy and its byte count", strategy, sent)
 	}
-	if len(formats) != 1 || formats[0] != "png" {
-		t.Fatalf("inline sends = %v, want exactly one png frame", formats)
-	}
-	if sizes[0] > herdr.MaxInlineFrameBytes {
-		t.Errorf("the png replacement is %d bytes, still over the limit", sizes[0])
-	}
-	if !strings.Contains(strategy, "png") {
-		t.Errorf("strategy = %q, want it to report the png replacement", strategy)
-	}
-	if sent <= 0 {
-		t.Errorf("sentBytes = %d, want the png payload size", sent)
+	if len(v.live) != 1 || v.live[0] != 1 {
+		t.Errorf("live ids = %v, want [1]", v.live)
 	}
 }
 
-func TestSizeRefusalKeepsTheStreamAndSkipsGraphicsSet(t *testing.T) {
-	// Point the socket at nothing: if the set fallback were reached it would
-	// fail with a dial error instead of the size error asserted below.
-	t.Setenv("HERDR_SOCKET_PATH", filepath.Join(t.TempDir(), "absent.sock"))
+func TestPutImageUsesFreshIDsAndFreesThePreviousOneAfterwards(t *testing.T) {
+	out := &lockedBuf{}
+	v := &Viewer{out: out}
+	enc := render.Encoded{Payload: []byte("abc")}
 
-	fs := &fakeStream{limit: 16} // refuses any real payload
-	v := &Viewer{transport: TransportStreamPNG, stream: fs, maxFrameBytes: localFrameBudget}
-
-	_, _, err := v.sendFrame(blankFrame(64, 64), herdr.Placement{}, 80, 24, 8, 16, v.beginTrace())
-	if !errors.Is(err, herdr.ErrFrameTooLarge) {
-		t.Fatalf("err = %v, want ErrFrameTooLarge (reaching graphics.set would give a dial error)", err)
+	for i := 0; i < 3; i++ {
+		out.Reset()
+		if err := v.putImage(enc, kgp.Placement{GridCols: 2, GridRows: 2}, nil); err != nil {
+			t.Fatal(err)
+		}
+		got := out.String()
+		id := uint32(i + 1)
+		tx := fmt.Sprintf("i=%d,", id)
+		if !strings.Contains(got, tx) {
+			t.Fatalf("image %d: output lacks %q: %q", i, tx, got)
+		}
+		del := fmt.Sprintf("\x1b_Ga=d,d=I,i=%d,q=2\x1b\\", id-1)
+		if i == 0 {
+			if strings.Contains(got, "a=d") {
+				t.Errorf("first image deleted something: %q", got)
+			}
+			continue
+		}
+		if !strings.HasSuffix(got, del) {
+			t.Errorf("image %d: output should end by freeing the old id: %q", i, got)
+		}
+		if strings.Index(got, "a=T") > strings.Index(got, "a=d") {
+			t.Errorf("image %d: old id freed before the new one was sent: %q", i, got)
+		}
 	}
-	if v.stream == nil {
-		t.Error("a size refusal must not tear down the connection")
-	}
-	if _, _, _, closes := fs.snapshot(); closes != 0 {
-		t.Errorf("stream was closed %d times, want 0", closes)
-	}
-	if got := v.errorStatus(err); !strings.Contains(got, "太大") {
-		t.Errorf("status = %q, want it to tell the reader the page is too large", got)
+	if len(v.live) != 1 || v.live[0] != 3 {
+		t.Errorf("live ids = %v, want only the newest [3]", v.live)
 	}
 }
 
-func TestConnectionErrorStillClosesTheStreamAndFallsBack(t *testing.T) {
-	t.Setenv("HERDR_SOCKET_PATH", filepath.Join(t.TempDir(), "absent.sock"))
-
-	fs := &fakeStream{sendErr: errors.New("write: broken pipe")}
-	v := &Viewer{transport: TransportStreamPNG, stream: fs, maxFrameBytes: localFrameBudget}
-
-	strategy, _, err := v.sendFrame(blankFrame(64, 64), herdr.Placement{}, 80, 24, 8, 16, v.beginTrace())
-	if v.stream != nil {
-		t.Error("a broken connection must be dropped, not reused")
+func TestPutImageWriteFailureKeepsOldIDsTracked(t *testing.T) {
+	v := &Viewer{out: failWriter{}, live: []uint32{5}, nextID: 5}
+	err := v.putImage(render.Encoded{Payload: []byte("x")}, kgp.Placement{}, nil)
+	if err == nil {
+		t.Fatal("want the write error")
 	}
-	if _, _, _, closes := fs.snapshot(); closes != 1 {
-		t.Errorf("stream closed %d times, want 1", closes)
+	if len(v.live) != 2 {
+		t.Errorf("live = %v, want old and new ids both tracked so a later clear frees them", v.live)
 	}
-	// The set fallback runs and fails on the absent socket, which is what
-	// proves it was reached at all.
-	if strategy != "set" || err == nil {
-		t.Errorf("strategy = %q err = %v, want the graphics.set fallback to have been attempted", strategy, err)
-	}
-	if errors.Is(err, herdr.ErrFrameTooLarge) {
-		t.Errorf("err = %v, want a connection failure rather than a size refusal", err)
+	_, _, sendErr := v.sendFrame(blankFrame(16, 16), kgp.Placement{}, v.beginTrace())
+	if got := v.errorStatus(sendErr); !strings.Contains(got, "寫入終端") {
+		t.Errorf("status = %q, want a write failure message", got)
 	}
 }
 
-// The real session must satisfy the interface the send path is written against.
-var _ frameSink = (*herdr.StreamSession)(nil)
+func TestClearImagesFreesEveryLiveID(t *testing.T) {
+	out := &lockedBuf{}
+	v := &Viewer{out: out, live: []uint32{4, 9}, nextID: 9}
+	if err := v.clearImages(false); err != nil {
+		t.Fatal(err)
+	}
+	want := "\x1b_Ga=d,d=I,i=4,q=2\x1b\\\x1b_Ga=d,d=I,i=9,q=2\x1b\\"
+	if got := out.String(); got != want {
+		t.Errorf("clearImages wrote %q, want %q", got, want)
+	}
+	if len(v.live) != 0 {
+		t.Errorf("live = %v after clear", v.live)
+	}
+	out.Reset()
+	if err := v.clearImages(false); err != nil || out.String() != "" {
+		t.Errorf("clearing nothing wrote %q err=%v", out.String(), err)
+	}
+}
+
+func TestStaleRefineIsNotDrawn(t *testing.T) {
+	out := &lockedBuf{}
+	v := &Viewer{out: out}
+	err := v.putImage(render.Encoded{Payload: []byte("x")}, kgp.Placement{}, func() bool { return false })
+	if !errors.Is(err, errStale) || out.String() != "" || v.nextID != 0 {
+		t.Errorf("err=%v out=%q nextID=%d, want nothing written", err, out.String(), v.nextID)
+	}
+}
+
+func TestSanePixelCell(t *testing.T) {
+	for _, c := range []struct {
+		name                 string
+		pxW, pxH, cols, rows int
+		wantW, wantH         int
+		ok                   bool
+	}{
+		{"typical", 1990, 720, 199, 36, 10, 20, true},
+		{"unreported", 0, 0, 199, 36, 0, 0, false},
+		{"the nonsense seen on this machine", 1368, 2985, 199, 36, 0, 0, false},
+		{"no grid", 100, 100, 0, 0, 0, 0, false},
+	} {
+		w, h, ok := sanePixelCell(c.pxW, c.pxH, c.cols, c.rows)
+		if ok != c.ok || (ok && (w != c.wantW || h != c.wantH)) {
+			t.Errorf("%s: got %d,%d,%v want %d,%d,%v", c.name, w, h, ok, c.wantW, c.wantH, c.ok)
+		}
+	}
+}
+
+func TestComputePlacementClampsToThePane(t *testing.T) {
+	p := computePlacement(80, 23, 10, 20, 900, 500)
+	if p.GridCols > 80 || p.GridRows > 23 {
+		t.Errorf("box %dx%d exceeds the 80x23 pane", p.GridCols, p.GridRows)
+	}
+}
 
 // readLog returns everything the viewer wrote to its log file.
 func readLog(t *testing.T, path string) string {
@@ -735,57 +683,52 @@ func readLog(t *testing.T, path string) string {
 	return string(data)
 }
 
-func TestBrowseOnlyQuitDoesNotCallGraphicsClear(t *testing.T) {
-	// A pane that only ever browsed has no layer: graphics were never
-	// started, so there is nothing to clear and herdr rejects the call
-	// (invalid_layer_id). Pointing the socket at nothing makes any attempt
-	// fail loudly, so the log is proof the call was skipped.
-	t.Setenv("HERDR_SOCKET_PATH", filepath.Join(t.TempDir(), "absent.sock"))
-	logPath := filepath.Join(t.TempDir(), "viewer.log")
+func TestBrowseOnlyQuitWritesNoGraphics(t *testing.T) {
+	// Nothing was ever drawn, so there is nothing to delete.
 	term, buf := fakeScreen(t)
-
-	v := &Viewer{term: term, opts: Options{PaneID: "w1:p1", LogPath: logPath}}
-	v.logf = openLog(logPath)
+	out := &lockedBuf{}
+	v := &Viewer{term: term, out: out}
 	v.shutdown()
-	v.logf.Close()
-
-	if got := readLog(t, logPath); strings.Contains(got, "graphics.clear") {
-		t.Errorf("shutdown called graphics.clear with no layer; log said:\n%s", got)
+	if got := out.String(); got != "" {
+		t.Errorf("shutdown wrote graphics escapes with no image drawn: %q", got)
 	}
 	assertRestored(t, buf.String())
 }
 
-func TestReadingQuitStillClearsItsLayer(t *testing.T) {
-	// The other half of the guard: once a layer exists, shutdown must still
-	// try to clear it. The socket is absent, so the attempt shows up as a
-	// logged failure rather than silence.
-	t.Setenv("HERDR_SOCKET_PATH", filepath.Join(t.TempDir(), "absent.sock"))
-	logPath := filepath.Join(t.TempDir(), "viewer.log")
+func TestReadingQuitFreesItsImagesBeforeRestoring(t *testing.T) {
 	term, _ := fakeScreen(t)
-
-	v := &Viewer{term: term, opts: Options{PaneID: "w1:p1", LogPath: logPath}, layerID: "page"}
-	v.logf = openLog(logPath)
+	out := &lockedBuf{}
+	v := &Viewer{term: term, out: out, live: []uint32{2}, nextID: 2}
 	v.shutdown()
-	v.logf.Close()
-
-	if got := readLog(t, logPath); !strings.Contains(got, "final graphics.clear") {
-		t.Errorf("shutdown skipped the clear for an existing layer; log said:\n%s", got)
+	got := out.String()
+	if !strings.Contains(got, "a=d,d=I,i=2,") || !strings.HasSuffix(got, "\x1b_Ga=d,d=A,q=2\x1b\\") {
+		t.Errorf("shutdown wrote %q, want the live id and delete-all", got)
 	}
 }
 
-func TestReadingHelpOverlayReleasesAndReopensTheStream(t *testing.T) {
-	// The graphics layer composites above text, so the page image has to be
-	// handed back while the key table is up, and restored when it goes.
-	t.Setenv("HERDR_SOCKET_PATH", filepath.Join(t.TempDir(), "absent.sock"))
+func TestSignalExitFreesImages(t *testing.T) {
+	term, _ := fakeScreen(t)
+	out := &lockedBuf{}
+	v := &Viewer{term: term, out: out, live: []uint32{1}, nextID: 1}
+	_ = v.signalExit(syscall.SIGTERM)
+	if !strings.Contains(out.String(), "a=d,d=I,i=1,") {
+		t.Errorf("signal exit left the image behind: %q", out.String())
+	}
+}
+
+func TestReadingHelpOverlayFreesTheImageAndRestartsGraphics(t *testing.T) {
+	// The image composites above text, so it has to go while the key table
+	// is up and come back when it closes.
 	logPath := filepath.Join(t.TempDir(), "viewer.log")
 	term, _ := fakeScreen(t)
-	stream := &fakeStream{}
+	out := &lockedBuf{}
 
 	v := &Viewer{
 		term:          term,
+		out:           out,
 		opts:          Options{PaneID: "w1:p1", LogPath: logPath, PDFPath: "/tmp/x.pdf"},
-		layerID:       "page",
-		stream:        stream,
+		live:          []uint32{3},
+		nextID:        3,
 		graphicsReady: true,
 	}
 	v.logf = openLog(logPath)
@@ -797,14 +740,11 @@ func TestReadingHelpOverlayReleasesAndReopensTheStream(t *testing.T) {
 	if !v.helping {
 		t.Fatal("? did not open the overlay")
 	}
-	if v.stream != nil {
-		t.Error("the frame stream is still open while the overlay is up")
+	if got := out.String(); !strings.Contains(got, "a=d,d=I,i=3,") {
+		t.Errorf("the page image was not freed before the overlay: %q", got)
 	}
-	if stream.closeCount() != 1 {
-		t.Errorf("stream closes = %d, want 1", stream.closeCount())
-	}
-	if v.graphicsReady {
-		t.Error("graphicsReady stayed set, so the stream would not be reopened")
+	if len(v.live) != 0 || v.graphicsReady {
+		t.Errorf("live=%v graphicsReady=%v, want both cleared", v.live, v.graphicsReady)
 	}
 
 	// Any key returns to the page and asks for a redraw.
@@ -817,10 +757,24 @@ func TestReadingHelpOverlayReleasesAndReopensTheStream(t *testing.T) {
 	if !v.needRedraw {
 		t.Error("closing the overlay did not request a redraw")
 	}
-	// startGraphics ran: with no socket the stream open fails and the
-	// transport falls back, which is logged either way.
-	if got := readLog(t, logPath); !strings.Contains(got, "transport=") {
+	if got := readLog(t, logPath); !strings.Contains(got, "transport=kitty") {
 		t.Errorf("graphics were not restarted after the overlay; log said:\n%s", got)
+	}
+}
+
+func TestLegacyTransportIsLoggedOnceAndIgnored(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "viewer.log")
+	v := &Viewer{opts: Options{LogPath: logPath, LegacyTransport: "stream-rgba"}}
+	v.logf = openLog(logPath)
+	defer v.logf.Close()
+	v.configureSession()
+	v.configureSession()
+	got := readLog(t, logPath)
+	if n := strings.Count(got, "stream-rgba"); n != 1 {
+		t.Errorf("legacy value logged %d times, want once:\n%s", n, got)
+	}
+	if v.transport != TransportKitty {
+		t.Errorf("transport = %q, want kitty", v.transport)
 	}
 }
 

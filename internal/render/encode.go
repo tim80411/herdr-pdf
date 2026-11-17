@@ -14,7 +14,7 @@ import (
 // transport's hard ceiling, so there is nothing safe to send.
 var ErrTooLarge = errors.New("page does not fit the frame size limit")
 
-// Encoded is one frame compressed and ready for herdr's stream API, along
+// Encoded is one frame compressed and ready to send as a Kitty graphics PNG, along
 // with the dimensions it ended up at (a scaled-down strategy changes them).
 type Encoded struct {
 	Payload  []byte

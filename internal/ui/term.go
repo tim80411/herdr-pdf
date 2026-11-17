@@ -1,5 +1,5 @@
 // Package ui holds terminal plumbing for the viewer (raw mode, alt screen,
-// key decoding, status-line layout) with no dependency on herdr's socket API.
+// key decoding, status-line layout) with no dependency on herdr.
 package ui
 
 import (
@@ -22,6 +22,23 @@ const (
 	reverseVideo    = "\x1b[7m"
 	resetSGR        = "\x1b[0m"
 )
+
+// lockedWriter makes each Write atomic with respect to the others.
+type lockedWriter struct {
+	mu sync.Mutex
+	w  io.Writer
+}
+
+func (l *lockedWriter) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.w.Write(p)
+}
+
+// Stdout is the one writer for the pane's output. Text and Kitty graphics
+// escapes share that stream now, so a whole escape must go out in a single
+// Write here, never interleaved with a status line from another goroutine.
+var Stdout io.Writer = &lockedWriter{w: os.Stdout}
 
 // Screen is the terminal surface the viewer draws on. Taking it as an
 // interface lets the shutdown path be driven without a tty.
@@ -47,7 +64,7 @@ type Terminal struct {
 
 // New creates a Terminal bound to the process's stdin file descriptor.
 func New() *Terminal {
-	return &Terminal{fd: int(os.Stdin.Fd()), out: os.Stdout, raw: true}
+	return &Terminal{fd: int(os.Stdin.Fd()), out: Stdout, raw: true}
 }
 
 // NewForOutput creates a Terminal that writes its control sequences to w and
@@ -116,8 +133,8 @@ func (t *Terminal) WriteString(s string) {
 }
 
 // ClearScreen clears the alternate screen's text content and homes the
-// cursor. It does not touch any graphics layer — those are a separate
-// compositing plane in herdr.
+// cursor. Callers free their Kitty images explicitly instead of relying on
+// the clear to do it.
 func (t *Terminal) ClearScreen() {
 	t.WriteString(clearScreenSeq)
 }
@@ -130,4 +147,14 @@ func Size() (cols, rows int, err error) {
 		return 0, 0, err
 	}
 	return int(ws.Col), int(ws.Row), nil
+}
+
+// SizePixels reports the pane's size in pixels as the terminal states it, 0
+// when it does not say. Callers treat it as a hint, not as layout truth.
+func SizePixels() (w, h int) {
+	ws, err := unix.IoctlGetWinsize(int(os.Stdout.Fd()), unix.TIOCGWINSZ)
+	if err != nil {
+		return 0, 0
+	}
+	return int(ws.Xpixel), int(ws.Ypixel)
 }
